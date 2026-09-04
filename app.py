@@ -877,6 +877,9 @@ def render_report():
 
     st.write("---")
 
+    # ===== 📈 月度供需预测（出力结构, 上级要求②）=====
+    render_supply_demand(df_disc, target_year, target_month)
+
     # ===== 📊 供需与价格（信息披露报告, 34个月）=====
     if df_disc is not None and not df_disc.empty:
         st.markdown("### 📊 供需与价格（信息披露报告 · 全月度）")
@@ -992,32 +995,15 @@ def render_report():
 
     st.write("---")
 
-    # ===== 📤 外送预计（净送出预测）=====
-    if df_trade is not None and not df_trade.empty and "净送出_亿kWh" in df_trade.columns:
-        st.markdown("### 📤 外送预计（净送出预测）")
-        st.caption("来源: 月度交易计划(2024-01~2026-08, 32期)。甘肃为送端省, 净送出长期走高; "
-                   "与检修预测叠加重判断'省内供给是否双重承压'。")
-        fc_out = seasonal_forecast_value(df_trade, "净送出_亿kWh", target_year, target_month)
-        fc_out2 = seasonal_forecast_value(df_trade, "中长期外送_亿kWh", target_year, target_month)
-        c_o1, c_o2 = st.columns(2)
-        with c_o1:
-            if fc_out:
-                st.metric("预计净送出", f"{fc_out['point']} 亿kWh",
-                          help=f"区间 {fc_out['lo']}~{fc_out['hi']} 亿kWh; {fc_out['method']}")
-            else:
-                st.info(f"{target_month} 月无历史同期净送出数据")
-        with c_o2:
-            if fc_out2:
-                st.metric("预计中长期外送", f"{fc_out2['point']} 亿kWh",
-                          help=f"区间 {fc_out2['lo']}~{fc_out2['hi']} 亿kWh; {fc_out2['method']}")
-            else:
-                st.info(f"{target_month} 月无历史同期中长期外送数据")
-        if fc_out and risk == "高":
-            st.warning("⚠ 检修高峰月 + 外送高位: 省内供给或双重收紧, 重点关注现货价格上行")
-        elif fc_out:
-            st.success("检修低谷 / 外送可控: 省内供给相对宽松")
+    # ===== 📤 外送与受入受出预测（上级要求③）=====
+    render_outward(df_trade, target_year, target_month, risk)
 
     st.write("---")
+
+    # ===== 暂未开放模块提示（缺数据）=====
+    st.info("⚠ 暂未开放模块（缺对应数据，已列入《数据索取清单》）："
+            "① 具体影响电价区间 / ④ 日前-实时分时价格区间（缺现货价格数据）；"
+            "⑤ 每日实盘复盘（缺实时价格 + 新能源功率预测系统）。数据到位后直接接入本看板，无需重构。")
 
     # ===== ④ 交易解读(最终结论) =====
     st.markdown("### ④ 交易解读(最终结论)")
@@ -1110,6 +1096,167 @@ def build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equ
     lines += ["", "---",
               "*本报告基于历史规律生成, 实际检修以月度披露文件为准*"]
     return "\n".join(lines).encode("utf-8")
+
+
+# ==================== 月度供需预测（出力结构） ====================
+def _fc_one(dd, col, ty, tm):
+    """对单列做目标月季节性预测; 返回 {point,lo,hi,method} 或 None。"""
+    if col not in dd.columns:
+        return None
+    return seasonal_forecast_value(dd.copy(), col, ty, tm)
+
+def _fc_sum(dd, cols, ty, tm):
+    """对多列分别预测后求和(如 新能源=风电+光伏), 区间按分量相加。"""
+    pts, los, his = [], [], []
+    methods = []
+    for c in cols:
+        r = _fc_one(dd, c, ty, tm)
+        if r:
+            pts.append(r["point"]); los.append(r["lo"]); his.append(r["hi"])
+            methods.append(r.get("method", ""))
+    if not pts:
+        return None
+    return {"point": round(sum(pts), 1), "lo": round(sum(los), 1), "hi": round(sum(his), 1),
+            "method": f"分项季节性求和({'+'.join(cols)})"}
+
+def _conf_label(r):
+    """由预测区间相对宽度给置信度标签。"""
+    if not r or r["point"] <= 0:
+        return "—"
+    rel = (r["hi"] - r["lo"]) / r["point"]
+    if rel < 0.3:
+        return "高"
+    if rel < 0.6:
+        return "中"
+    return "低"
+
+def render_supply_demand(dd, target_year, target_month):
+    """② 月度供需预测(出力结构): 新能源/火电/水电/总发电/全社会负荷 + 供需关系 + 置信度。
+    数据源: 月度披露报告的分电源上网电量与全社会用电量(已有, 不依赖缺失的三份数据)。
+    """
+    st.markdown("### 📈 月度供需预测（出力结构）")
+    st.caption("数据来源: 月度信息披露报告 · 分电源上网电量 / 全社会用电量（已有数据）。"
+               "针对所选月份做季节性预测；已披露月显示实际值（标注✓）。新能源=风电+光伏(光电)。")
+    if dd is None or dd.empty:
+        st.info("暂无披露数据，本面板待补"); return
+    dd = dd.dropna(subset=["月份"]).copy()
+    dd["新能源光伏_亿kWh"] = dd.get("上网_光电_亿kWh", pd.Series(dtype=float)).fillna(
+        dd.get("上网_光伏_亿kWh", pd.Series(dtype=float)))
+    target_str = f"{target_year}-{target_month:02d}"
+    ar = dd[dd["月份"] == target_str]
+    has_actual = not ar.empty
+
+    def _actual(col):
+        if not has_actual:
+            return None
+        v = ar[col].sum(skipna=True)
+        return None if pd.isna(v) else float(v)
+
+    specs = [
+        ("新能源出力", _fc_sum(dd, ["上网_风电_亿kWh", "新能源光伏_亿kWh"], target_year, target_month),
+         _actual("上网_风电_亿kWh") if _actual("上网_风电_亿kWh") is None else
+         (_actual("上网_风电_亿kWh") + (_actual("新能源光伏_亿kWh") or 0))),
+        ("火电出力", _fc_one(dd, "上网_火电_亿kWh", target_year, target_month), _actual("上网_火电_亿kWh")),
+        ("水电出力", _fc_one(dd, "上网_水电_亿kWh", target_year, target_month), _actual("上网_水电_亿kWh")),
+        ("总发电量", _fc_one(dd, "上网电量当月_亿kWh", target_year, target_month), _actual("上网电量当月_亿kWh")),
+        ("全社会负荷", _fc_one(dd, "全社会用电量当月_亿kWh", target_year, target_month), _actual("全社会用电量当月_亿kWh")),
+    ]
+
+    cards = st.columns(5)
+    for (lab, fc_r, act), c in zip(specs, cards):
+        with c:
+            if fc_r is None:
+                st.metric(lab, "—", help="无历史同期数据")
+                continue
+            conf = _conf_label(fc_r)
+            if act is not None:
+                st.metric(lab, f"{act:.0f} 亿kWh ✓", delta=f"预测 {fc_r['point']:.0f}",
+                          help=f"预测区间 {fc_r['lo']}~{fc_r['hi']} 亿kWh; 置信度{conf}; {fc_r['method']}")
+            else:
+                st.metric(lab, f"{fc_r['point']:.0f} 亿kWh",
+                          help=f"预测区间 {fc_r['lo']}~{fc_r['hi']} 亿kWh; 置信度{conf}; {fc_r['method']}")
+
+    # 供需关系: 发电量 vs 负荷 历史 + 目标月预测点
+    import plotly.graph_objects as go
+    st.markdown("**供需关系（发电量 vs 全社会负荷）**")
+    fig = go.Figure()
+    if dd["上网电量当月_亿kWh"].notna().any():
+        fig.add_bar(x=dd["月份"], y=dd["上网电量当月_亿kWh"], name="发电量(上网电量)",
+                    marker_color="#185FA5")
+    if dd["全社会用电量当月_亿kWh"].notna().any():
+        fig.add_scatter(x=dd["月份"], y=dd["全社会用电量当月_亿kWh"],
+                        mode="lines+markers", name="全社会负荷(用电量)",
+                        line=dict(color="#D85A30", width=2))
+    gen_fc = _fc_one(dd, "上网电量当月_亿kWh", target_year, target_month)
+    load_fc = _fc_one(dd, "全社会用电量当月_亿kWh", target_year, target_month)
+    if gen_fc:
+        fig.add_scatter(x=[target_str], y=[gen_fc["point"]], mode="markers",
+                        marker=dict(color="#185FA5", size=16, symbol="diamond", line=dict(color="white")),
+                        name="发电量预测")
+    if load_fc:
+        fig.add_scatter(x=[target_str], y=[load_fc["point"]], mode="markers",
+                        marker=dict(color="#D85A30", size=16, symbol="diamond", line=dict(color="white")),
+                        name="负荷预测")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=40), plot_bgcolor="white",
+                      yaxis_title="亿kWh", legend=dict(font=dict(size=10), orientation="h",
+                      yanchor="bottom", y=1.05, x=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+    if gen_fc and load_fc:
+        gap = gen_fc["point"] - load_fc["point"]
+        if gap > 0:
+            st.success(f"📊 供需关系: 预计发电量超出负荷约 **{gap:.0f} 亿kWh**, 省内供给充裕, 富余电力可外送/储能。")
+        else:
+            st.warning(f"📊 供需关系: 预计发电量低于负荷约 **{abs(gap):.0f} 亿kWh**, 存在缺口, 需外购或压减外送。")
+    st.caption("注: '发电量'以省级结算口径上网电量近似; '负荷'以全社会用电量(电量口径)近似, 非瞬时功率。精确MW需新能源功率预测系统(待接入)。")
+
+# ==================== 外送与受入受出预测 ====================
+def render_outward(df_trade, target_year, target_month, risk):
+    """③ 外送与受入受出预测(上级要求③): 净送出/外送/外购(受入) 预测 + 受入受出表 + 重大事项录入占位 + 置信度。
+    数据来源: 月度交易计划(已有)。'送入省份重大事项'依赖外部信息, 先留人工录入占位。
+    """
+    if df_trade is None or df_trade.empty:
+        return
+    st.markdown("### 📤 外送与受入受出预测")
+    st.caption("来源: 月度交易计划(2024-01~2026-08, 32期)。甘肃为送端省; 净送出/外送为'送出', 外购电为'受入'。置信度=季节性预测区间。")
+    cols_cfg = [
+        ("预计净送出", "净送出_亿kWh"),
+        ("预计中长期外送", "中长期外送_亿kWh"),
+        ("预计外购(受入)", "外购电_亿kWh"),
+    ]
+    cards = st.columns(3)
+    preds = {}
+    for (lab, col), c in zip(cols_cfg, cards):
+        r = seasonal_forecast_value(df_trade, col, target_year, target_month)
+        preds[col] = r
+        with c:
+            if r:
+                st.metric(lab, f"{r['point']} 亿kWh",
+                          help=f"区间 {r['lo']}~{r['hi']} 亿kWh; 置信度{_conf_label(r)}; {r.get('method','—')}")
+            else:
+                st.info(f"{target_month} 月无历史同期{lab}数据")
+
+    st.markdown("**受入受出预测表**")
+    tbl = []
+    for lab, col in cols_cfg:
+        r = preds.get(col)
+        if r:
+            tbl.append({"项目": lab, "预测(亿kWh)": r["point"],
+                        "区间下限": r["lo"], "区间上限": r["hi"], "置信度": _conf_label(r)})
+    if tbl:
+        st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+
+    st.markdown("**送入省份下月重大事项（人工录入）**")
+    st.caption("此部分依赖外部信息(如湖南台风→用电减少→外送剩余), 目前先留空, 待人工维护后接入。")
+    note = st.text_area("记录下月重大事项（如：湖南台风→用电减少，外送电量剩余）",
+                        value="", height=70, key="outward_note")
+    if note.strip():
+        st.success(f"已记录: {note.strip()[:60]}（会话内临时记录，未持久化；后续可接入数据库字段）")
+
+    if preds.get("净送出_亿kWh") and risk == "高":
+        st.warning("⚠ 检修高峰月 + 外送高位: 省内供给或双重收紧, 重点关注现货价格上行")
+    elif preds.get("净送出_亿kWh"):
+        st.success("检修低谷 / 外送可控: 省内供给相对宽松")
 
 
 # ==================== 数据台账(简单导出页) ====================
