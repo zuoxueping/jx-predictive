@@ -156,7 +156,7 @@ def load_trade_plan():
 @st.cache_data(ttl=600)
 def load_tieline():
     """联络线分时: 每日24h交换功率/电量(外送/受入的小时级实测)。"""
-    return pd.DataFrame(run_query("SELECT * FROM 联络线分时"))
+    return pd.DataFrame(run_query("SELECT * FROM tieline"))
 
 
 def build_reserve_lookup(df_disc, df_bal):
