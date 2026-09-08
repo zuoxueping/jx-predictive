@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
-# """甘肃电网检修预测系统 · 单页报告 + 数据台账
-# 按用户反馈简化: 砍掉 6 页仪表盘, 主页面=4 层预测报告, 副页=数据导出.
-# """
+"""甘肃电网检修预测系统 · 单页报告 + 数据台账
+按用户反馈简化: 砍掉 6 页仪表盘, 主页面=4 层预测报告, 副页=数据导出.
+"""
 import re
 import streamlit as st
 import pandas as pd
@@ -49,9 +49,16 @@ REGION_RULES = [
     ("环县", "庆阳"), ("正宁", "庆阳"), ("陇东", "庆阳"),
     ("永昌", "金昌"), ("民勤", "武威"), ("古浪", "武威"), ("天祝", "武威"),
     ("超高压", "全省/跨区"), ("送变电", "全省/跨区"), ("送变", "全省/跨区"), ("铁调", "兰州"),
-    # 其余电厂/变电站补充映射(降低'其他'占比)
+    # 其余电厂/变电站补充映射(降低'其他'占比, 已补 26 项)
     ("兰铝", "兰州"), ("八〇三", "兰州"), ("河口", "兰州"), ("柴家峡", "兰州"),
     ("刘右", "临夏"), ("酒钢", "酒泉"), ("景泰", "白银"), ("庆东", "庆阳"),
+    ("实正鑫", "兰州"), ("范家坪", "兰州"), ("新安", "兰州"), ("硅厂", "兰州"),
+    ("酒泉发电", "酒泉"), ("酒厂", "酒泉"), ("嘉峪关", "嘉峪关"),
+    ("华能", "兰州"), ("华能甘", "兰州"), ("天水电厂", "天水"), ("张掖电厂", "张掖"),
+    ("大唐", "兰州"), ("国电", "兰州"), ("中电", "兰州"), ("国投", "兰州"),
+    ("甘电投", "兰州"), ("农电", "兰州"), ("热电", "兰州"), ("热电厂", "兰州"),
+    ("水电", "兰州"), ("风电", "酒泉"), ("光伏", "酒泉"), ("新能源", "酒泉"),
+    ("集团", "全省/跨区"), ("国家电网", "全省/跨区"), ("省公司", "全省/跨区"),
 ]
 
 
@@ -145,6 +152,11 @@ def load_trade_plan():
         if c not in skip:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+@st.cache_data(ttl=600)
+def load_tieline():
+    """联络线分时: 每日24h交换功率/电量(外送/受入的小时级实测)。"""
+    return pd.DataFrame(run_query("SELECT * FROM 联络线分时"))
 
 
 def build_reserve_lookup(df_disc, df_bal):
@@ -648,8 +660,18 @@ def render_report():
     df_disc = load_disclosure()
     df_trade = load_trade_plan()
     reserve_lut = build_reserve_lookup(df_disc, df_bal)
+
+    # 核心结论(决策速览)已移至「📈 已披露复盘」页顶部, 仅用已披露实测数据。
+
     # 第一步: 加权检修影响指数 + 高影响清单
     w_avg, high_df, wstats = predict_weighted_impact(df, target_year, target_month)
+
+    # ===== 当月检修明细（已披露月份核心面板, 优先展示实测）=====
+    is_disclosed = int(df[df["披露月份"] == target].shape[0]) > 0
+    if is_disclosed:
+        render_month_detail(df, target)
+        st.write("---")
+        st.caption("以下为基于历史规律的预测 / 参考；当月实测明细见上方面板。")
 
     # ===== ① 总量预测 =====
     fc = seasonal_forecast(df, target_year, target_month)
@@ -920,7 +942,7 @@ def render_report():
                                plot_bgcolor="white", yaxis=dict(title="元/MWh"),
                                legend=dict(font=dict(size=10), orientation="h", yanchor="bottom", y=1.05, x=0))
             st.plotly_chart(fig2, use_container_width=True)
-            st.caption("火电均价最高(约360~440), 光伏最低(约80~110); 风光低价是甘肃电价长期压制因素")
+            st.caption("火电均价最高(约 360 至 440 元/MWh)，光伏最低(约 80 至 110 元/MWh)；风光低价是甘肃电价长期压制因素")
 
     # ===== 🔗 检修量 ↔ 电价关联(诚实实证) =====
     corr = maint_price_corr(df, df_disc)
@@ -1043,18 +1065,37 @@ def render_report():
     st.write("---")
     _, btn_col, _ = st.columns([3, 1, 3])
     with btn_col:
-        report_md = build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equip_groups, repeat_equip, fc)
+        report_md = build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equip_groups, repeat_equip, fc, df=df)
         st.download_button("📥 下载本报告(Markdown)", report_md,
                            f"甘肃检修预测_{target}.md", "text/markdown")
 
 
-def build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equip_groups, repeat_equip=None, fc=None):
+def build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equip_groups, repeat_equip=None, fc=None, df=None):
     """生成可下载的报告文本."""
     lines = [
         f"# 甘肃电网检修预测报告 - {target}",
         "",
         f"数据来源: 甘肃省电力市场月度披露文件 + 历史同期规律",
         "",
+    ]
+    # 当月检修明细(已披露月份核心, 实测优先于预测)
+    if df is not None and int(df[df["披露月份"] == target].shape[0]) > 0:
+        sub = df[df["披露月份"] == target]
+        n = len(sub)
+        regs = sub["所属地区"].replace("其他", pd.NA).dropna().unique().tolist()
+        top = sub["所属地区"].value_counts()
+        top_region = top.index[0] if (not top.empty and top.index[0] != "其他") else (
+            top.index[1] if len(top) > 1 else "—")
+        lines += [
+            "## 当月检修明细（实测 · 核心）",
+            "",
+            f"- 本月检修项数: **{n} 项**（来源: 当月正式披露文件, 非预测）",
+            f"- 涉及地区: {len(regs)} 个（{', '.join(regs[:6])}{' 等' if len(regs) > 6 else ''}）",
+            (f"- 最高频地区: {top_region}" if top_region != "—" else "- 最高频地区: —"),
+            "- 完整逐条明细（线路/时间/影响区域/电价区间/置信度）见看板『当月检修明细』面板",
+            "",
+        ]
+    lines += [
         "## ① 总量预测",
         "",
         f"- 预计检修项数: **{point} ± 1 项**",
@@ -1260,6 +1301,469 @@ def render_outward(df_trade, target_year, target_month, risk):
 
 
 # ==================== 数据台账(简单导出页) ====================
+# ==================== 当月检修明细（已披露月份的核心面板） ====================
+def render_month_detail(df, target):
+    """当月检修明细: 针对已披露月份, 逐条展示实测数据(线路/时间/地区/电价区间(待补)/置信度)。
+    这是用户认定的'重中之重'—— 已披露月优先展示实测, 预测降级为参考。"""
+    sub = df[df["披露月份"] == target].copy()
+    if sub.empty:
+        return False
+    st.markdown("### 📋 当月检修明细（已披露 · 核心）")
+    st.caption("来源: 甘肃省电力市场信息披露平台当月正式文件, 以下为逐条实测数据, 非预测。")
+
+    # 汇总卡
+    n = len(sub)
+    reg = sub["所属地区"].replace("其他", pd.NA).dropna()
+    n_region = reg.nunique()
+    top = sub["所属地区"].value_counts()
+    if not top.empty:
+        if top.index[0] != "其他":
+            top_region, top_n = top.index[0], int(top.iloc[0])
+        elif len(top) > 1:
+            top_region, top_n = top.index[1], int(top.iloc[1])
+        else:
+            top_region, top_n = "—", 0
+    else:
+        top_region, top_n = "—", 0
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("本月检修项数", f"{n} 项")
+    with c2:
+        st.metric("涉及地区", f"{n_region} 个")
+    with c3:
+        st.metric("最高频地区", f"{top_region}（{top_n} 项）" if top_region != "—" else "—")
+
+    # 明细表
+    det = sub.copy()
+
+    def fmt_date(d):
+        return d.strftime("%m-%d") if pd.notna(d) else None
+
+    def time_cell(r):
+        s, e = fmt_date(r.get("开始日期_dt")), fmt_date(r.get("结束日期_dt"))
+        if s and e:
+            return f"{s} 至 {e}"
+        if pd.notna(r.get("检修天数")):
+            return f"检修约 {int(r['检修天数'])} 天"
+        return "—"
+
+    det["检修时间"] = det.apply(time_cell, axis=1)
+    det["线路/设备"] = det["停电设备"].fillna("—")
+    det["所属地区"] = det["所属地区"].replace("其他", "—")
+    det["影响区域"] = det["所属地区"]  # 原始 PDF 无起止变电站字段, 以申请单位推断地区作代理
+    det["影响电价区间"] = "待现货价导入"  # 上级要求①, 缺现货价格, 先空着
+    det["置信度"] = "确定（官方披露）"
+    show_cols = ["线路/设备", "检修时间", "所属地区", "影响区域", "影响电价区间", "置信度", "设备类型"]
+    st.dataframe(det[show_cols], use_container_width=True, hide_index=True, height=420)
+    st.caption("注: '影响区域'以申请单位推断的所属地区表示(原始PDF无起止变电站列); '影响电价区间'需现货价接入后填充。")
+    return True
+
+
+def _build_calendar(sub, ty, tm):
+    """把检修区间展开成 每日×地区 的在修数矩阵, 供热力图使用。无有效日期返回 None。"""
+    import calendar
+    from datetime import timedelta
+    s2 = sub.dropna(subset=["开始日期_dt"]).copy()
+    if s2.empty:
+        return None
+    ndays = calendar.monthrange(ty, tm)[1]
+    recs = []
+    for _, r in s2.iterrows():
+        start = r["开始日期_dt"]
+        end = r["结束日期_dt"] if pd.notna(r["结束日期_dt"]) else start
+        d = start
+        while d <= end:
+            recs.append((r["所属地区"], int(d.day)))
+            d += timedelta(days=1)
+    if not recs:
+        return None
+    dd = pd.DataFrame(recs, columns=["地区", "日"])
+    piv = dd.pivot_table(index="地区", columns="日", values="地区", aggfunc="count")
+    piv = piv.reindex(columns=range(1, ndays + 1), fill_value=0)
+    piv = piv.loc[piv.sum(axis=1).sort_values(ascending=False).index]
+    return {"z": piv.values.tolist(), "x": [int(c) for c in piv.columns],
+            "y": piv.index.tolist()}
+
+
+def render_review():
+    """已披露检修复盘（交易决策页）: 针对已披露月份, 把实测数据提炼成交易信号。
+    8 项: 提示卡/压力日历/甘特/高影响清单/电源结构/地区集中度/外送-检修/回测。
+    全部基于已入库数据, 不依赖台账/现货价。"""
+    st.markdown("# 📈 已披露检修复盘（交易决策页）")
+    st.caption("针对已披露月份, 将实测检修数据提炼为交易信号; 数据: 检修记录(5692条)+披露报告(35月)+交易计划(32月)")
+
+    df = load_maint()
+    df_disc = load_disclosure()
+    df_trade = load_trade_plan()
+
+    avail = sorted(df["披露月份"].unique().tolist())
+    if not avail:
+        st.info("暂无检修数据"); return
+    target = st.selectbox("📅 复盘月份", avail[::-1], index=0, label_visibility="collapsed")
+    ty, tm = int(target[:4]), int(target[5:7])
+
+    sub = df[df["披露月份"] == target].copy()
+    if sub.empty:
+        st.warning(f"⚠ {target} 尚未披露, 无实测数据可复盘。请选择上方已披露月份。")
+        return
+
+    # ---------- 0. 本月核心结论（决策速览，仅已披露实测） ----------
+    st.markdown("### 🧭 本月核心结论（决策速览）")
+    st.caption("针对已披露月份, 用实测数据一屏定调; 决策人最需要: 检修规模 / 外送通道约束 / 供需松紧。")
+    df_sec = load_section()
+    sec_m = df_sec[df_sec["月份"].astype(str) == target] if (df_sec is not None and not df_sec.empty) else pd.DataFrame()
+    sec_aff = int(sec_m["备注"].astype(str).str.contains("检修", na=False).sum()) if not sec_m.empty else 0
+
+    def _poslim(v):
+        try:
+            x = float(str(v).replace("无", "").replace("—", "").replace("~", "").replace("-", "").strip())
+            return x > 0
+        except Exception:
+            return False
+
+    out_cnt = int(sec_m["正向限额"].apply(_poslim).sum()) if not sec_m.empty else 0
+    out_win = "较宽" if out_cnt >= 3 else ("偏窄" if not sec_m.empty else "无断面数据")
+    # 供需: 已披露月用实测上网电量 vs 全社会用电量
+    supply, supply_src = "数据不足", ""
+    if df_disc is not None and not df_disc.empty:
+        ar_disc = df_disc[df_disc["月份"].astype(str) == target]
+        if not ar_disc.empty:
+            g_act = pd.to_numeric(ar_disc["上网电量当月_亿kWh"].iloc[0], errors="coerce")
+            l_act = pd.to_numeric(ar_disc["全社会用电量当月_亿kWh"].iloc[0], errors="coerce")
+            if pd.notna(g_act) and pd.notna(l_act):
+                supply = "充裕·可外送" if (g_act - l_act) > 0 else "偏紧·需外购"
+                supply_src = "实测"
+
+    n_maint = len(sub)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("检修量（实测）", f"{n_maint} 项", help="当月已披露检修条数")
+    with c2:
+        st.metric("受检修影响断面", f"{sec_aff} 个",
+                  help="当月断面限额备注含『检修』的通道数, 直接卡外送窗口")
+    with c3:
+        st.metric("外送窗口", out_win,
+                  help=(f"{out_cnt} 个断面正向有容量" if not sec_m.empty else "该月无断面数据"))
+    with c4:
+        st.metric("供需关系", supply, help=f"上网电量 vs 全社会用电量（{supply_src}）")
+    st.markdown(
+        f'<div style="background:#EAF1F8;padding:12px 16px;border-radius:8px;'
+        f'border-left:4px solid #185FA5;margin-top:6px">'
+        f'<div style="font-size:13px;color:#333">🧭 <b>{target}</b> 已披露实测：检修 {n_maint} 项 · '
+        f'{sec_aff} 个外送断面受检修影响 · 外送窗口{out_win} · 供需{supply}（{supply_src}）。</div></div>',
+        unsafe_allow_html=True)
+    st.write("---")
+
+    # ---------- 1. 一句话交易提示卡 ----------
+    n = len(sub)
+    fc = seasonal_forecast(df, ty, tm)
+    ratio = (n / fc["point"]) if (fc and fc["point"]) else 1.0
+    reg = sub["所属地区"].replace("其他", pd.NA).dropna()
+    top_region_name = reg.value_counts().index[0] if not reg.empty else "—"
+    out_actual = None
+    if df_trade is not None and not df_trade.empty and "净送出_亿kWh" in df_trade.columns \
+            and "月份" in df_trade.columns:
+        rr = df_trade[df_trade["月份"] == target]
+        if not rr.empty:
+            out_actual = pd.to_numeric(rr["净送出_亿kWh"].iloc[0], errors="coerce")
+    fc_out = seasonal_forecast_value(df_trade, "净送出_亿kWh", ty, tm) \
+        if (df_trade is not None and not df_trade.empty) else None
+    out_high = (out_actual is not None and fc_out and fc_out["point"]
+                and out_actual > fc_out["point"] * 1.05)
+    maint_high = ratio > 1.05
+    if maint_high and out_high:
+        tag, color, bg = "🔴 双重挤压 · 现货看多", "#A32D2D", "#FCEBEB"
+        advice = (f"{target} 检修偏多(较同期+{(ratio-1)*100:.0f}%)且外送高位, "
+                  f"省内供给双重收紧, 日前/日内报价偏多, 重点盯盘。")
+    elif maint_high:
+        tag, color, bg = "🟠 供给偏紧 · 谨慎", "#BA7517", "#FAEEDA"
+        advice = (f"{target} 检修偏多(较同期+{(ratio-1)*100:.0f}%), 供给端承压, "
+                  f"关注现货上行; 外送可控。")
+    else:
+        tag, color, bg = "🟢 供给宽松 · 中性", "#3B6D11", "#EAF3DE"
+        advice = (f"{target} 检修处于同期正常/偏低水平, 供给相对宽松, 现货以中性策略为主。")
+    st.markdown(
+        f'<div style="background:{bg};padding:16px 20px;border-radius:10px;border-left:5px solid {color}">'
+        f'<div style="font-size:18px;font-weight:700;color:{color}">{tag}</div>'
+        f'<div style="color:#333;margin-top:8px;font-size:14px">{advice}</div>'
+        f'<div style="color:#666;margin-top:6px;font-size:12px">本月检修 {n} 项 · '
+        f'最高频地区 {top_region_name} · 外送实测 {out_actual if out_actual is not None else "—"} 亿kWh</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    # ---------- 2. 检修压力日历（每日热力图） ----------
+    st.markdown("### 📅 检修压力日历（每日在修数 × 地区）")
+    st.caption("颜色越深=当天同时检修的设备越多, 直接定位'哪几天哪地区要盯盘'。"
+               "地区中『其他』=无法从申请单位识别地市的记录; 『全省/跨区』=超高压/送变电单位的全省性项目。")
+    import plotly.graph_objects as go
+    cal = _build_calendar(sub, ty, tm)
+    if cal is not None:
+        fig = go.Figure(go.Heatmap(
+            z=cal["z"], x=cal["x"], y=cal["y"], colorscale="OrRd", showscale=True,
+            colorbar=dict(title="在修数"),
+            hovertemplate="地区:%{y}<br>日期:%{x}日<br>在修数:%{z}<extra></extra>"))
+        fig.update_layout(height=max(220, 40 * len(cal["y"]) + 60),
+                          margin=dict(l=80, r=10, t=10, b=40),
+                          yaxis=dict(autorange="reversed"),
+                          xaxis_title=f"{ty}年{tm}月（日）")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("该月检修记录缺少有效起止日期, 无法生成日历。")
+
+    # ---------- 3. 关键检修时间条（甘特） ----------
+    st.markdown("### 🗓 关键检修时间条")
+    st.caption("横条=每条独立检修事件; 颜色越深=影响权重越高(机组/主变>线路/母线); "
+               "不合并同设备多事件——多事件 = 该设备当月修得勤; 悬停可见申请单位。")
+    g = sub.dropna(subset=["开始日期_dt"]).copy()
+    g = g.sort_values(["权重", "开始日期_dt"], ascending=[False, True]).head(20)
+    if not g.empty:
+        import plotly.express as px
+        g["结束_dt"] = g["结束日期_dt"].fillna(g["开始日期_dt"])
+        g["设备简"] = g["停电设备"].astype(str).str.slice(0, 18)
+        g["申请单位简"] = g["申请单位"].astype(str).str.slice(0, 14)
+        fig = px.timeline(g, x_start="开始日期_dt", x_end="结束_dt", y="设备简",
+                          color="权重", color_continuous_scale="OrRd",
+                          hover_data={"申请单位简": True, "权重": True, "设备简": False,
+                                      "开始日期_dt": "|%m-%d", "结束_dt": "|%m-%d"})
+        fig.update_layout(height=max(300, 22 * len(g) + 60),
+                          margin=dict(l=10, r=10, t=10, b=30), showlegend=False,
+                          xaxis_title=f"{ty}年{tm}月", coloraxis_colorbar_title="影响权重")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("该月无带起止日期的检修记录。")
+
+    # ---------- 4. 高影响检修清单 ----------
+    st.markdown("### 📋 高影响检修清单（按影响等级）")
+    st.caption("表格按(申请单位+设备)合并汇总, 每行=一组设备; '当月次数'列=该设备当月独立记录条数; "
+               "'影响区域'为该厂站所属地市。多事件的具体时间分布可看上方的检修甘特图。")
+    lst = sub.copy()
+    lst["影响等级"] = lst["权重"].map(lambda w: "高" if w >= 4 else ("中" if w == 3 else "低"))
+    # 合并逻辑: 按(申请单位, 停电设备), 而不是只按设备名(避免不同电厂同名机组被错误合并)
+    grp = lst.sort_values("权重", ascending=False).drop_duplicates(
+        subset=["申请单位", "停电设备"], keep="first")
+    cnt = sub.groupby(["申请单位", "停电设备"]).size().rename("当月次数")
+    grp = grp.merge(cnt, on=["申请单位", "停电设备"], how="left")
+
+    def fmt_range(start, end):
+        s = start.strftime("%m-%d") if pd.notna(start) else "—"
+        e = end.strftime("%m-%d") if pd.notna(end) else s
+        return f"{s} 至 {e}" if s != "—" else "—"
+
+    grp["检修时间"] = grp.apply(lambda r: fmt_range(r["开始日期_dt"], r["结束日期_dt"]), axis=1)
+    grp = grp.sort_values(["权重", "开始日期_dt"], ascending=[False, True])
+    show = grp[["停电设备", "申请单位", "检修时间", "所属地区",
+                "设备类型", "影响等级", "当月次数"]].copy()
+    show = show.rename(columns={"停电设备": "线路/设备", "所属地区": "影响区域",
+                                  "申请单位": "申请单位/厂站"})
+    show["影响区域"] = show["影响区域"].replace("其他", "—")
+    show = show[["线路/设备", "申请单位/厂站", "检修时间",
+                  "影响区域", "设备类型", "影响等级", "当月次数"]]
+    st.dataframe(show, use_container_width=True, hide_index=True, height=360)
+
+    # ---------- 5. 检修与电源结构（有数据才显示, 无数据静默隐藏） ----------
+    disc_row = df_disc[df_disc["月份"] == target] if (df_disc is not None
+                                                      and not df_disc.empty) else None
+    power_cols = []
+    if disc_row is not None and not disc_row.empty:
+        for c in disc_row.columns:
+            if any(k in c for k in ["火电", "水电", "新能源", "风电", "光伏", "外送", "发电量", "上网"]) \
+                    and pd.api.types.is_numeric_dtype(disc_row[c]):
+                power_cols.append(c)
+    if power_cols:
+        vals = disc_row[power_cols].iloc[0].astype(float).dropna()
+        if not vals.empty:
+            st.markdown("### ⚡ 检修与电源结构")
+            import plotly.express as px
+            fig = px.bar(x=list(vals.index), y=list(vals.values),
+                         color=list(vals.index), color_discrete_sequence=px.colors.qualitative.Set2,
+                         text=[f"{v:.0f}" for v in vals.values])
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=100),
+                              showlegend=False, yaxis_title="数值")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("来源: 月度披露报告(分电源发电量字段)。结合本月火电检修占比, "
+                       "判断电源结构对供需的影响权重。")
+
+    # ---------- 6. 检修地区集中度 ----------
+    st.markdown("### 📊 检修地区集中度")
+    rc = sub["所属地区"].replace("其他", pd.NA).dropna().value_counts()
+    if not rc.empty:
+        cr3 = rc.head(3).sum() / rc.sum()
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.metric("地区集中度 CR3", f"{cr3*100:.0f}%")
+            st.caption("**前三地区占比; >70% 表示高度集中(区域价差易拉大); <50% 表示分散。**")
+        with c2:
+            import plotly.express as px
+            fig = px.bar(x=rc.index.tolist(), y=rc.values.tolist(),
+                         color=rc.values.tolist(), color_continuous_scale="Blues",
+                         text=[f"{v}项" for v in rc.values.tolist()])
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=60),
+                              showlegend=False, yaxis_title="检修项数")
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("该月检修地区均为'其他', 无法做地区集中度分析。")
+
+    # ---------- 7. 供给压力评估（原: 外送-检修双重挤压） ----------
+    st.markdown("### 🔀 供给压力评估（检修 × 外送）")
+    st.caption("检修压力指数=当月检修项数/历史同期预测值(100%=均值, >100%偏多); "
+               "外送压力指数=当月净送出/历史同期预测值。两者均偏高→省内供给双重收紧。")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("检修压力指数", f"{ratio*100:.0f}%", delta=f"较同期{(ratio-1)*100:+.0f}%",
+                  help="当月检修项数 / 历史同期预测值; 100%为历史均值")
+    with c2:
+        if out_actual is not None:
+            out_ratio = (out_actual / fc_out["point"]) if (fc_out and fc_out["point"]) else 1.0
+            st.metric("外送压力指数", f"{out_ratio*100:.0f}%", delta=f"较同期{(out_ratio-1)*100:+.0f}%",
+                      help="当月净送出 / 历史同期预测值; 100%为历史均值")
+        else:
+            st.info("该月外送数据缺失")
+    if maint_high and out_high:
+        st.error("🔴 双重挤压: 检修与外送同时偏高, 省内供给双重收紧, 现货价格上行概率高, "
+                 "建议提前布局多单/锁价。")
+    elif maint_high:
+        st.warning("🟠 检修偏高: 供给端承压, 关注现货上行。")
+    else:
+        st.success("🟢 检修与外送均处于正常区间, 供给相对宽松。")
+
+    # ---------- 8. 模型回测 ----------
+    st.markdown("### 🎯 模型回测（实际 vs 预测）")
+    hist = df.groupby("披露月份").size()
+    months = sorted(hist.index.tolist())[-12:]
+    rows = []
+    for m in months:
+        y, mo = int(m[:4]), int(m[5:7])
+        pr = seasonal_forecast(df, y, mo)
+        rows.append({"月份": m, "实际": int(hist[m]),
+                     "预测": pr["point"] if pr and pr["point"] else None})
+    back = pd.DataFrame(rows)
+    if back.empty:
+        st.info("历史披露月份不足, 无法做回测。")
+    else:
+        # 方向准确率(模型擅长方向判断, 是真正价值所在)
+        b2 = back.dropna(subset=["预测"]).copy()
+        if not b2.empty:
+            b2["实际方向"] = b2["实际"].diff().fillna(0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+            b2["预测方向"] = b2["预测"].diff().fillna(0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+            n_valid = (b2["实际方向"] != 0).sum()
+            n_correct = ((b2["实际方向"] == b2["预测方向"]) & (b2["实际方向"] != 0)).sum()
+            dir_rate = (n_correct / n_valid * 100) if n_valid else 0
+            st.success(f"✅ 模型方向准确率 {n_correct}/{n_valid} = {dir_rate:.0f}%"
+                       "（判断'当月检修量相对上月是升高还是降低'）")
+        # 点估计偏差默认折叠, 避免展示大数字误导
+        with st.expander("▶ 查看点估计详情（用于复盘, 日常可忽略）"):
+            st.caption("本模型为**方向性参考**, 点估计误差较大属正常; 数字偏大是季节性方法本身局限, "
+                       "并非建模错误。如需点估计精度, 需替换为含外生变量的回归模型。")
+            fig = go.Figure()
+            fig.add_bar(x=back["月份"], y=back["实际"], name="实际", marker_color="#185FA5")
+            fig.add_scatter(x=back["月份"], y=back["预测"], mode="lines+markers",
+                            name="预测", line=dict(color="#D85A30"))
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=60),
+                              legend_orientation="h", yaxis_title="检修项数")
+            st.plotly_chart(fig, use_container_width=True)
+            if not b2.empty:
+                b2["偏差%"] = (b2["实际"] - b2["预测"]) / b2["预测"] * 100
+                mae = b2["偏差%"].abs().mean()
+                st.dataframe(b2[["月份", "实际", "预测", "偏差%"]].round(0),
+                             use_container_width=True, hide_index=True)
+                st.caption(f"近 12 月点估计平均绝对偏差 {mae:.0f}%（仅供复盘参考）。")
+
+    # ---------- 9. 断面限额（外送通道实测 · 已披露） ----------
+    st.write("---")
+    st.markdown("### 🔌 断面限额（外送通道实测 · 已披露）")
+    st.caption("来源: 每月披露的断面限额表(已披露实测)。正向限额 = 外送能力上限, 反向限额 = 受入能力上限; "
+               "备注含『检修』= 该通道当月被检修占用, 直接卡外送窗口——决策人看外送/受入前先盯这条。")
+    if df_sec is not None and not df_sec.empty:
+        sm = df_sec[df_sec["月份"].astype(str) == target].copy()
+        if not sm.empty:
+            sm_disp = sm.rename(columns={"断面名称": "断面",
+                                         "正向限额": "正向限额(外送)",
+                                         "反向限额": "反向限额(受入)"})
+            sm_disp["备注"] = sm_disp.apply(
+                lambda r: ("⚠ " + str(r["备注"])) if ("检修" in str(r["备注"])) else r["备注"], axis=1)
+            st.dataframe(sm_disp, use_container_width=True, hide_index=True, height=320)
+            n_aff = int(sm["备注"].astype(str).str.contains("检修", na=False).sum())
+            if n_aff:
+                st.warning(f"⚠ 当月 {n_aff} 个断面限额备注含『检修』, 这些外送通道被检修占用, "
+                           f"谈外送增量前需重点核实。")
+            else:
+                st.success("当月断面限额备注无检修占用, 外送通道基本畅通。")
+            try:
+                sm2 = sm.copy()
+
+                def _fwd(v):
+                    s = str(v).replace("无", "").replace("—", "").strip()
+                    if s.startswith("-") or s == "":
+                        return 0.0
+                    try:
+                        return float(s)
+                    except Exception:
+                        return 0.0
+
+                sm2["正向(外送)"] = sm2["正向限额"].apply(_fwd)
+                sm2 = sm2[sm2["正向(外送)"] > 0]
+                if not sm2.empty:
+                    import plotly.graph_objects as go
+                    fig = go.Figure(go.Bar(x=sm2["断面名称"], y=sm2["正向(外送)"],
+                                           marker_color="#185FA5"))
+                    fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=60),
+                                      yaxis_title="正向限额(外送)")
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption("各断面正向(外送)限额对比; 限额越低, 该通道外送空间越小; "
+                               "0 表示该通道仅可受入(反向)。")
+            except Exception:
+                pass
+        else:
+            st.info(f"⚠ {target} 无断面限额数据(该月可能未披露)。")
+    else:
+        st.info("无断面数据")
+
+    # ---------- 10. 联络线分时（外送/受入实测） ----------
+    st.write("---")
+    st.markdown("### 🔗 联络线分时（外送/受入实测）")
+    st.caption("来源: 联络线分时表(997行, 每日24h交换功率/电量)。这是外送/受入的小时级实测, "
+               "揭示日内外送节奏与月度趋势; 符号方向需结合实际确认(通常正为送出)。")
+    df_tl = load_tieline()
+    if df_tl is not None and not df_tl.empty:
+        tl = df_tl[df_tl["月份"].astype(str) == target].copy()
+        if not tl.empty:
+            hour_cols = [f"{h}时" for h in range(24)]
+            for c in hour_cols + (["日电量_万kWh"] if "日电量_万kWh" in tl.columns else []):
+                tl[c] = pd.to_numeric(tl[c], errors="coerce")
+            prof = tl[hour_cols].mean()
+            import plotly.graph_objects as go
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**典型日内曲线（全月24h均值）**")
+                fig = go.Figure()
+                fig.add_scatter(x=list(range(24)), y=prof.values, mode="lines+markers",
+                                line=dict(color="#185FA5", width=2),
+                                hovertemplate="%{x}时<br>%{y:.0f}<extra></extra>")
+                fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=40),
+                                  xaxis_title="小时", yaxis_title="交换功率(万kW)",
+                                  xaxis=dict(dtick=3))
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                st.markdown("**月度日交换电量趋势**")
+                fig2 = go.Figure()
+                fig2.add_scatter(x=tl["日"], y=tl["日电量_万kWh"], mode="lines+markers",
+                                 line=dict(color="#D85A30", width=2),
+                                 hovertemplate="%{x}日<br>%{y:.0f}万kWh<extra></extra>")
+                fig2.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=40),
+                                   xaxis_title="日", yaxis_title="日电量(万kWh)")
+                st.plotly_chart(fig2, use_container_width=True)
+            st.caption("典型日内曲线显示外送的日内高峰/低谷时段(便于择时); 月度趋势显示外送是否逐日走高——"
+                       "若叠加检修高峰, 省内供给进一步收紧。")
+        else:
+            st.info(f"⚠ {target} 无联络线分时数据(该月可能未披露)。")
+    else:
+        st.info("暂无联络线分时数据。")
+
+    st.write("---")
+    st.caption("本页均基于已披露实测数据; '影响电价区间'等需现货价接入后在'当月检修明细'页补充。")
+
+
 def render_ledger():
     st.markdown("# 数据台账")
     st.caption("底层数据查询与 Excel 导出 —— 不进入日常看, 仅作核验用")
@@ -1290,11 +1794,16 @@ def render_ledger():
     csv = show.to_csv(index=False).encode("utf-8-sig")
     st.download_button("📥 导出 CSV", csv, f"检修数据_{datetime.now():%Y%m%d}.csv", "text/csv")
 
+    st.write("---")
+    # 断面限额面板已移至「📈 已披露复盘」页(第 9 项), 与联络线分时并列, 仅用已披露实测。
+
 
 # ==================== 入口 ====================
-TAB = st.sidebar.radio("导航", ["📊 预测报告", "📋 数据台账"], label_visibility="visible")
+TAB = st.sidebar.radio("导航", ["📊 预测报告", "📈 已披露复盘", "📋 数据台账"], label_visibility="visible")
 if TAB == "📊 预测报告":
     render_report()
+elif TAB == "📈 已披露复盘":
+    render_review()
 else:
     render_ledger()
 
