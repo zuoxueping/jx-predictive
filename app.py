@@ -106,6 +106,7 @@ def run_query(sql):
 @st.cache_data(ttl=600)
 def load_maint():
     df = pd.DataFrame(run_query("SELECT * FROM maint"))
+    df = df.drop(columns=["_row_id"], errors="ignore")
     for c in ["检修天数", "重复披露", "ID"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -129,15 +130,16 @@ def load_bal():
     for c in df.columns:
         if c not in ("_row_id", "月份"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    return df.drop(columns=["_row_id"], errors="ignore")
 
 @st.cache_data(ttl=600)
 def load_section():
-    return pd.DataFrame(run_query("SELECT * FROM section"))
+    return pd.DataFrame(run_query("SELECT * FROM section")).drop(columns=["_row_id"], errors="ignore")
 
 @st.cache_data(ttl=600)
 def load_disclosure():
     df = pd.DataFrame(run_query("SELECT * FROM disclosure"))
+    df = df.drop(columns=["_row_id"], errors="ignore")
     skip = {"file", "月份", "平衡月份", "装机口径", "skip_reason", "skipped"}
     for c in df.columns:
         if c not in skip:
@@ -147,6 +149,7 @@ def load_disclosure():
 @st.cache_data(ttl=600)
 def load_trade_plan():
     df = pd.DataFrame(run_query("SELECT * FROM trade_plan"))
+    df = df.drop(columns=["_row_id"], errors="ignore")
     skip = {"file", "月份", "skipped", "skip_reason"}
     for c in df.columns:
         if c not in skip:
@@ -156,7 +159,42 @@ def load_trade_plan():
 @st.cache_data(ttl=600)
 def load_tieline():
     """联络线分时: 每日24h交换功率/电量(外送/受入的小时级实测)。"""
-    return pd.DataFrame(run_query("SELECT * FROM tieline"))
+    return pd.DataFrame(run_query("SELECT * FROM tieline")).drop(columns=["_row_id"], errors="ignore")
+
+
+def _wx_window(days=10):
+    """从 weather_hourly 取未来 N 天全网(12 点位平均)的可作业小时比例.
+
+    受限条件(户外高空/吊装/带电作业通用阈值):
+      - 风速 10m > 10.7m/s (6 级, 高空/吊装上限)
+      - 雷暴 = 1
+      - 降水 > 0.5mm/h
+      - 气温 > 40℃ 或 < -15℃ (极端, 户外作业时间限制)
+
+    返回 (可作业小时比例 0-100, 详情字符串) 或 None(数据不足).
+    """
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS total, "
+            "       SUM(CASE WHEN 风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5 "
+            "                  OR 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS bad "
+            "FROM weather_hourly "
+            "WHERE 时间 > NOW() AND 时间 < DATE_ADD(NOW(), INTERVAL %s DAY)",
+            (days + 1,))
+        r = cur.fetchone()
+        conn.close()
+        total = int(r[0] or 0); bad = int(r[1] or 0)
+        if total < 100:
+            return None
+        good = total - bad
+        pct = good / total * 100
+        msg = (f"未来 {days} 天全网(12 点位平均)可作业 {good}/{total} 小时({pct:.0f}%); "
+               f"受限触发: 风>10.7m/s 或 雷暴 或 降水>0.5mm 或 极端温度")
+        return pct, msg
+    except Exception:
+        return None
 
 
 def build_reserve_lookup(df_disc, df_bal):
@@ -226,14 +264,45 @@ SEASONS = {
 }
 PEAK = {3, 4, 5, 9, 10, 11}
 
+_CAP_CACHE = None
+def load_capacity():
+    """读月度披露报告.装机总(万kW), 缓存为 {YYYY-MM: 容量}。"""
+    global _CAP_CACHE
+    if _CAP_CACHE is not None:
+        return _CAP_CACHE
+    try:
+        rows = run_query("SELECT `月份`, `装机总_万kW` FROM `月度披露报告`")
+        d = {}
+        for r in rows:
+            ym = r.get("月份"); c = r.get("装机总_万kW")
+            d[ym] = float(c) if c is not None else None
+        _CAP_CACHE = d
+    except Exception:
+        _CAP_CACHE = {}
+    return _CAP_CACHE
+
+def cap_for(y, m):
+    """取某年某月装机容量(万kW); 缺失时回退到不晚于该月的最近已知值。"""
+    d = load_capacity()
+    key = f"{y}-{m:02d}"
+    if key in d and d[key]:
+        return d[key]
+    best = None
+    for k, v in d.items():
+        if v and k <= key:
+            if best is None or k > best[0]:
+                best = (k, v)
+    return best[1] if best else None
+
 def seasonal_forecast(df, target_year, target_month):
     """改进版预测: 历史同月均值 + 线性趋势 + 年际波动区间.
 
-    改进点(对应 2026-09 实测低估 22% 的修复):
-    1) 历史年份≥2时趋势权重提到 0.8, 捕捉装机/负荷增长, 不再保守求和
-    2) 置信区间改用"同月年际相对波动"定宽, 替代围绕保守点估的窄泊松区间,
-       避免小样本(≤2点)时区间过窄、包不住真实值
-    3) 识别"上年同期异常低"的披露不全月份, 给出警告, 避免系统性低估
+    方法说明:
+    - 历史同月样本通常仅 2~3 个, 趋势外推最不可信, 故趋势权重设 0.3(保守),
+      主体由同月均值承担, 避免小样本趋势跑飞。
+    - 区间宽度按"同月年际相对波动"定(本质是历史波动范围, 非统计置信区间,
+      样本不足以支撑 80% 置信区间的名义), 避免小样本时区间过窄、包不住真实值。
+    - 识别"上年同期异常低"的披露不全月份, 给出警告, 避免系统性低估。
     """
     sub = df[df["月"] == target_month].copy()
     prior = sub[sub["年"].astype(int) < target_year]
@@ -262,7 +331,7 @@ def seasonal_forecast(df, target_year, target_month):
         trend_pred = z[0] * target_year + z[1]
         # 趋势预测做防御性裁剪, 放宽到均值±100%, 避免小样本趋势跑飞但仍捕捉强增长
         trend_pred = float(np.clip(trend_pred, avg * 0.4, avg * 2.0))
-        w_trend = 0.8  # 趋势显著时主权重(保留20%均值缓冲防过拟合)
+        w_trend = 0.3  # 趋势权重保守(样本少, 趋势最不可信); 主体由同月均值承担
     else:
         trend_pred = counts[0]
         w_trend = 0.0
@@ -270,6 +339,26 @@ def seasonal_forecast(df, target_year, target_month):
     # 融合: 趋势主导(≥2年), 否则纯均值
     point = int(round((1 - w_trend) * avg + w_trend * trend_pred))
     point = max(0, point)
+
+    # v2: 容量归一化季节预测 —— 检修量随装机增长而涨, 直接外推会把"增长"当成"趋势"放大;
+    #     改算"每GW检修率"(稳定季节信号)再乘回目标月容量, 消除增长带来的假趋势。
+    norm_point = None
+    if len(counts) >= 2:
+        _rates, _tcap = [], cap_for(target_year, target_month)
+        for _y, _c in zip(years_arr, counts):
+            _cap = cap_for(int(_y), target_month)
+            if _cap:
+                _rates.append(_c / _cap)
+        if len(_rates) >= 2 and _tcap:
+            _norm_rate = float(np.mean(_rates))
+            norm_point = int(round(_norm_rate * _tcap))
+            point = norm_point  # 归一化为主, 区间随之定宽
+            # 目标月已有记录时, 与归一化预期比对, 标记可能的抓取不全
+            _act = int(sub[sub["年"].astype(int) == target_year].shape[0])
+            if _act > 0 and abs(_act - norm_point) / max(norm_point, 1) > 0.5:
+                dq = (f"该月检修记录({_act}项)与容量归一化预期(~{norm_point}项)偏差>50%, "
+                      f"可能数据抓取不全, 预测置信度低")
+                warn = (warn + "; " + dq) if warn else dq
 
     # ③ 置信区间: 历史样本少时, 用同月年际相对波动定宽
     #    (替代原来围绕保守点估的窄泊松区间, 避免包不住真实值)
@@ -283,8 +372,12 @@ def seasonal_forecast(df, target_year, target_month):
     if hi <= lo:  # 防止区间退化
         hi = lo + 1
 
-    method = (f"历史同月均值 {avg:.0f} + 趋势外推 {trend_pred:.0f} "
-              f"(趋势权重 {w_trend:.0%}); 区间按同月年际波动 ±{rel_spread:.0%}")
+    if norm_point is not None:
+        method = (f"容量归一化季节预测: 同月每GW检修率 {_norm_rate:.5f} × 目标月容量 {_tcap:.0f}万kW"
+                  f" → {norm_point}项; 区间按同月年际波动 ±{rel_spread:.0%}")
+    else:
+        method = (f"历史同月均值 {avg:.0f} + 趋势外推 {trend_pred:.0f} "
+                  f"(趋势权重 {w_trend:.0%}); 区间按同月年际波动 ±{rel_spread:.0%}")
     return {"point": point, "lo": lo, "hi": hi,
             "season": season, "risk": risk,
             "method": method, "warn": warn}
@@ -311,7 +404,7 @@ def seasonal_forecast_value(df_series, col, target_year, target_month):
     if len(vals) >= 2:
         z = np.polyfit(years_arr, vals, 1)
         trend_pred = float(np.clip(z[0] * target_year + z[1], avg * 0.4, avg * 2.0))
-        w = 0.8
+        w = 0.3
     else:
         trend_pred = float(vals[0])
         w = 0.0
@@ -476,14 +569,16 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
     1) 价格方向  2) 供给紧张度  3) 外送/外购窗口  4) 大客户履约
     """
     signals = []
-    # ----- 信号 1: 价格方向 -----
+    # ----- 信号 1: 月度平衡格局(价格数据未接入前, 以月度平衡格局判断代替"现货价格") -----
     if risk == "高":
-        signals.append(("📈 现货价格", "上移概率较高",
-                       f"{target_month}月属春秋检高峰, 历史上同期火电检修抬升电价概率>70%; "
-                       "中旬起日均价涨幅预计高于月度均值"))
+        signals.append(("📊 月度平衡格局", "偏紧(季节性)",
+                       f"{target_month}月属春秋检高峰, 历史同期火电检修偏多 → 月度平衡格局"
+                       f"季节性偏紧的概率较大; 但检修对电价的独立贡献证据不足(去季节化相关弱), "
+                       f"不宜单独据此重仓。〔来源:检修季节性 + 月度平衡表〕"))
     else:
-        signals.append(("📉 现货价格", "下移或震荡",
-                       f"{target_month}月属检修低谷/过渡, 火电可调容量充足, 电价大概率不冲高"))
+        signals.append(("📊 月度平衡格局", "宽松/中性",
+                       f"{target_month}月属检修低谷/过渡, 火电可调容量相对充足, "
+                       f"月度平衡格局大概率不紧张。〔来源:检修季节性 + 月度平衡表〕"))
 
     # ----- 信号 2: 供给紧张度 -----
     bal_ref = df_bal[df_bal["月份"].astype(str).str.contains(f"-{target_month:02d}", na=False)].copy() \
@@ -511,7 +606,7 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
             detail += f"; 备用率同比下降 {abs(reserve_trend):.1f}pp, 供给在收紧"
         elif reserve_trend >= 2:
             detail += f"; 备用率同比上升 {reserve_trend:.1f}pp, 供给在放松"
-        signals.append(("⚠ 供给端", verdict, detail))
+        signals.append(("⚠ 供给端", verdict, detail + "〔来源:月度平衡表〕"))
     else:
         signals.append(("— 供给端", "数据不足", "暂无历史平衡表数据"))
 
@@ -525,9 +620,9 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
         out_count = int(out_pos.sum())
         in_count = int(in_rev.sum())
         if out_count >= 3:
-            signals.append(("→ 外送窗口", "较宽", f"{out_count} 个断面正向有容量, 适合月底谈外送增量"))
+            signals.append(("→ 外送窗口", "较宽", f"{out_count} 个断面正向有容量, 适合月底谈外送增量〔来源:断面限额〕"))
         else:
-            signals.append(("→ 外送窗口", "偏窄", f"仅 {out_count} 个断面正向外送容量, 外送增量空间有限"))
+            signals.append(("→ 外送窗口", "偏窄", f"仅 {out_count} 个断面正向外送容量, 外送增量空间有限〔来源:断面限额〕"))
 
     # ----- 信号 4: 关键线路检修 -----
     heavy_equip_list = []
@@ -538,13 +633,13 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
             heavy_equip_list = heavy["停电设备"].value_counts().head(3).index.tolist()
     if len(heavy_equip_list) >= 2:
         signals.append(("🔌 关键线路", "多条线路检修",
-                       f"{len(heavy_equip_list)} 条关键线路同期A修/改造, 可能影响断面限额, 需提前核实外送窗口"))
+                       f"{len(heavy_equip_list)} 条关键线路同期A修/改造, 可能影响断面限额, 需提前核实外送窗口〔来源:检修计划〕"))
     elif len(heavy_equip_list) == 1:
         signals.append(("🔌 关键线路", "1 条线路检修",
-                       f"{heavy_equip_list[0]} 同期大修, 影响范围有限, 但需关注对应断面限额变化"))
+                       f"{heavy_equip_list[0]} 同期大修, 影响范围有限, 但需关注对应断面限额变化〔来源:检修计划〕"))
     else:
         signals.append(("🔌 关键线路", "无重大检修",
-                       "同期无 A 级或改造大修线路, 断面限额大概率不受影响"))
+                       "同期无 A 级或改造大修线路, 断面限额大概率不受影响〔来源:检修计划〕"))
 
     # ----- 信号 5: 外送 + 检修 叠加(供给双重压力) -----
     if df_trade is not None and not df_trade.empty and "净送出_亿kWh" in df_trade.columns:
@@ -559,7 +654,7 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
             if risk == "高" and out_val >= hi_thr:
                 verdict, detail = "双重收紧", (
                     f"检修属高峰(风险高) 且 预计净送出 {out_val:.0f} 亿kWh 处历史同期高位 → "
-                    f"省内供给双重承压, 现货价格上行动力最强, 建议月合约偏紧/现货多备")
+                    f"省内供给双重承压, 现货端偏多, 月合约偏谨慎〔来源:月度交易计划 + 检修〕")
             elif risk == "高":
                 verdict, detail = "检修偏紧", (
                     f"检修属高峰, 但预计净送出 {out_val:.0f} 亿kWh 未达高位, "
@@ -574,7 +669,307 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
                     f"省内供需最宽松, 合约可争取更优条款")
             signals.append(("📤 外送叠加", verdict, detail))
 
+    # ----- 信号 6: 气象作业窗口(weather_hourly, 未来 10 天) -----
+    wx = _wx_window(10)
+    if wx is not None:
+        pct, msg = wx
+        if pct >= 75:
+            verdict = f"充裕({pct:.0f}%)"
+        elif pct >= 55:
+            verdict = f"正常({pct:.0f}%)"
+        elif pct >= 35:
+            verdict = f"偏紧({pct:.0f}%)"
+        else:
+            verdict = f"紧张({pct:.0f}%)"
+        signals.append(("🌤 气象窗口", verdict, msg + "〔来源:weather_hourly〕"))
+    else:
+        signals.append(("🌤 气象窗口", "数据不足", "weather_hourly 未覆盖未来窗口, 跑 crawl_weather.py 即可补齐"))
+
     return signals
+
+# ==================== 天气-检修适配分析(weather_hourly × 已有数据) ====================
+def weather_daily_grid(days=10):
+    """未来 N 天逐日可作业率(12 点位平均). 返回 [(mm-dd, 可作业率%, 受限小时, 总小时), ...]."""
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DATE(时间) AS d, COUNT(*) AS total, "
+            "       SUM(CASE WHEN 风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5 "
+            "                  OR 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS bad "
+            "FROM weather_hourly "
+            "WHERE 时间 > NOW() AND 时间 < DATE_ADD(NOW(), INTERVAL %s DAY) "
+            "GROUP BY DATE(时间) ORDER BY d",
+            (days + 1,))
+        rows = cur.fetchall()
+        conn.close()
+        out = []
+        for d, total, bad in rows:
+            total = int(total or 0); bad = int(bad or 0)
+            if total == 0:
+                continue
+            out.append((d.strftime("%m-%d"), round((total - bad) / total * 100), bad, total))
+        return out
+    except Exception:
+        return []
+
+
+def point_weather_matrix(days=10):
+    """12 点位 × 未来 N 天 可作业率矩阵. 返回 DataFrame[点位, 日期, 可作业率%, 受限原因]."""
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 点位名称, DATE(时间) AS d, "
+            "       COUNT(*) AS total, "
+            "       SUM(CASE WHEN 风速_10m > 10.7 THEN 1 ELSE 0 END) AS wind_bad, "
+            "       SUM(CASE WHEN 雷暴 = 1 THEN 1 ELSE 0 END) AS thunder_bad, "
+            "       SUM(CASE WHEN 降水_mm > 0.5 THEN 1 ELSE 0 END) AS rain_bad, "
+            "       SUM(CASE WHEN 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS temp_bad "
+            "FROM weather_hourly "
+            "WHERE 时间 > NOW() AND 时间 < DATE_ADD(NOW(), INTERVAL %s DAY) "
+            "GROUP BY 点位名称, DATE(时间) ORDER BY 点位名称, d",
+            (days + 1,))
+        rows = cur.fetchall()
+        conn.close()
+        out = []
+        for pt, d, total, w_b, t_b, r_b, te_b in rows:
+            total = int(total or 0)
+            if total == 0:
+                continue
+            bad = int(w_b or 0) + int(t_b or 0) + int(r_b or 0) + int(te_b or 0)
+            # 主因: 哪种受限贡献最大
+            main = "风" if (w_b or 0) >= max(t_b or 0, r_b or 0, te_b or 0) else \
+                   "雷" if (t_b or 0) >= max(r_b or 0, te_b or 0) else \
+                   "雨" if (r_b or 0) >= (te_b or 0) else "温"
+            out.append({"点位": pt, "日期": d.strftime("%m-%d"),
+                        "可作业率%": round((total - bad) / total * 100),
+                        "受限原因": main if bad > 0 else "—"})
+        return out
+    except Exception:
+        return []
+
+
+def maint_weather_decision(df_maint, target_year, target_month, top_n=8):
+    """关键检修 × 未来天气 → 延期决策矩阵(含容量影响、行动建议).
+    返回 [(设备, 级别, 开始, 结束, 持续天, 重要度, 受限%, 行动, 调整建议), ...]
+    排序: 重要度 × (1 - 可作业率) 复合降序.
+    """
+    from datetime import datetime, timedelta
+    if df_maint is None or df_maint.empty or "开始日期_dt" not in df_maint.columns:
+        return []
+    cutoff = datetime.now() + timedelta(days=10)
+    sub = df_maint[(df_maint["年"].astype(str) == str(target_year)) &
+                   (df_maint["月"] == target_month) &
+                   (df_maint["开始日期_dt"] <= cutoff) &
+                   (df_maint["开始日期_dt"] >= datetime.now() - timedelta(days=1))]
+    if sub.empty:
+        return []
+
+    # 算每条的重要度分 = 等级分 × 持续天数
+    sub = sub.copy()
+    # 重要度 = 等级分 × 持续天数 (用本地 LEVEL_RANK, 不依赖 render_review)
+    _LR = {"A级检修": 5, "B级检修": 4, "C级检修": 3, "改造大修": 3, "D级检修": 2,
+           "消缺": 2, "检修预试": 2, "基建接入": 2, "例行检修": 1, "其他": 1}
+    sub["_sev"] = sub["检修级别"].map(lambda x: _LR.get(str(x).strip(), 1) if pd.notna(x) else 1)
+    sub["_days"] = (sub["结束日期_dt"] - sub["开始日期_dt"]).dt.days.fillna(1).clip(lower=1)
+    sub["_imp"] = sub["_sev"] * sub["_days"]
+    # 排序取 top_n*3 (后续按受限比例再过滤)
+    sub = sub.sort_values("_imp", ascending=False).head(top_n * 3)
+
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        out = []
+        for _, r in sub.iterrows():
+            sd = r.get("开始日期_dt"); ed = r.get("结束日期_dt")
+            if pd.isna(sd):
+                continue
+            ed = ed if pd.notna(ed) else sd
+            cur.execute(
+                "SELECT COUNT(*) AS total, "
+                "       SUM(CASE WHEN 风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5 "
+                "                  OR 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS bad "
+                "FROM weather_hourly WHERE 时间 >= GREATEST(%s, NOW()) AND 时间 <= %s",
+                (sd, ed))
+            rr = cur.fetchone()
+            total = int(rr[0] or 0); bad = int(rr[1] or 0)
+            if total == 0:
+                continue
+            bad_rate = bad / total
+            sev = int(r["_sev"]); days = int(r["_days"])
+            imp = int(r["_imp"])
+            equip = str(r.get("停电设备", ""))[:30]
+            level = str(r.get("检修级别", "—"))
+            # 行动建议
+            if bad_rate < 0.15:
+                action = "按期"
+                advice = "天气友好"
+            elif bad_rate < 0.30:
+                action = "关注"
+                advice = "准备备用日"
+            elif bad_rate < 0.45:
+                action = "建议改期"
+                advice = "择窗口重排"
+            else:
+                action = "强烈建议改期"
+                advice = "延期≥1 天"
+            out.append((equip, level, sd.strftime("%m-%d"), ed.strftime("%m-%d"),
+                        days, imp, round(bad_rate * 100), action, advice))
+        conn.close()
+        # 排序: 重要度降序 + 受限% 降序
+        out.sort(key=lambda x: (-x[5], -x[6]))
+        return out[:top_n]
+    except Exception:
+        return []
+
+
+def weather_maint_risk(df_maint, target_year, target_month):
+    """当月检修计划中落在天气受限窗口的条目(仅未来 10 天内开始的, 远期无预报).
+    返回 [(停电设备, 开始, 结束, 受限小时, 总小时, 风险等级), ...] 按风险降序.
+    """
+    from datetime import datetime, timedelta
+    if df_maint is None or df_maint.empty or "开始日期_dt" not in df_maint.columns:
+        return []
+    cutoff = datetime.now() + timedelta(days=10)
+    sub = df_maint[(df_maint["年"].astype(str) == str(target_year)) &
+                   (df_maint["月"] == target_month) &
+                   (df_maint["开始日期_dt"] <= cutoff)]
+    if sub.empty:
+        return []
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        out = []
+        for _, r in sub.iterrows():
+            sd = r.get("开始日期_dt"); ed = r.get("结束日期_dt")
+            if pd.isna(sd):
+                continue
+            ed = ed if pd.notna(ed) else sd
+            # 只统计检修区间与未来天气窗口的重叠部分(GREATEST 取较晚起点)
+            cur.execute(
+                "SELECT COUNT(*) AS total, "
+                "       SUM(CASE WHEN 风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5 "
+                "                  OR 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS bad "
+                "FROM weather_hourly WHERE 时间 >= GREATEST(%s, NOW()) AND 时间 <= %s",
+                (sd, ed))
+            rr = cur.fetchone()
+            total = int(rr[0] or 0); bad = int(rr[1] or 0)
+            if total == 0:
+                continue  # 检修区间不在天气覆盖窗, 跳过
+            rate = bad / total
+            lvl = "高" if rate >= 0.4 else ("中" if rate >= 0.25 else "低")
+            out.append((str(r.get("停电设备", "")), sd.strftime("%Y-%m-%d"),
+                        ed.strftime("%Y-%m-%d"), bad, total, lvl))
+        conn.close()
+        return sorted(out, key=lambda x: {"高": 0, "中": 1, "低": 2}.get(x[5], 3))
+    except Exception:
+        return []
+
+
+def render_weather_maint(target_year, target_month, df_maint, df_sec):
+    """天气 × 已有数据结合: ① 关键检修-天气-交易决策矩阵 ② 点位可作业矩阵 ③ 外送双重风险.
+    核心逻辑: 天气好不好不重要, 影不影响关键检修才重要.
+    """
+    st.write("---")
+    st.markdown("### 🌤 天气-检修适配分析")
+    st.caption("天气源: weather_hourly(12 点位, Open-Meteo, 模式格点预报). "
+               "⚠️ Open-Meteo 绝对温度与实测可能偏差 4~5℃, 本块仅用于趋势与受限阈值判断, 不作气温实测展示. "
+               "受限阈值: 风>10.7m/s 或 雷暴 或 降水>0.5mm 或 极端温度.")
+
+    # ===== ① 关键检修 × 天气 × 交易决策矩阵(最前: 最直接给交易建议) =====
+    decisions = maint_weather_decision(df_maint, target_year, target_month, top_n=8)
+    st.markdown("**🔁 关键检修-天气-交易决策矩阵**")
+    if decisions:
+        # 按行动分类
+        change = [d for d in decisions if "改期" in d[7]]
+        watch = [d for d in decisions if d[7] == "关注"]
+        ontrack = [d for d in decisions if d[7] == "按期"]
+
+        # 交易影响汇总
+        if change:
+            # 受影响容量分 = sum(重要度 × 受限比例)  越大越应改
+            impact_score = sum(d[5] * d[6] / 100 for d in change)
+            top = change[0]
+            st.error(
+                f"🔴 **交易影响**: {len(change)} 条高重要度检修落在受限窗口(总影响分 {impact_score:.1f}); "
+                f"最关键: [{top[0]}] {top[1]} {top[2]}~{top[3]} 受限 {top[6]}% → {top[7]}({top[8]}). "
+                f"若按建议调整, 可避免当月重要检修延期, 稳定供给侧预期."
+            )
+        elif watch:
+            st.warning(
+                f"🟡 {len(watch)} 条关键检修处于'关注'档(受限 15-30%); "
+                f"建议预留备用日期, 若执行前 24h 预报仍偏紧则调整."
+            )
+        else:
+            st.success(
+                f"🟢 关键检修(重要度前 {len(decisions)})天气全部'按期'档, "
+                f"本月无因天气延期的供给风险."
+            )
+
+        # 表格(用 dataframe 而不是 markdown, 列宽更友好)
+        import pandas as pd
+        df_d = pd.DataFrame(decisions, columns=[
+            "设备", "级别", "开始", "结束", "持续(天)", "重要度",
+            "受限%", "行动建议", "调整方向"
+        ])
+        st.dataframe(df_d, use_container_width=True, hide_index=True)
+        st.caption("重要度 = 等级分(A=5/B=4/C=3/D=2/改造大修=3/其他=1) × 持续天数; "
+                   "受限% = 检修区间内天气受限小时比例.")
+    else:
+        st.info("当月无未来 10 天内开始的检修, 暂无适配决策.")
+
+    # ===== ② 12 点位 × 未来 10 天 可作业矩阵(取代原"逐日柱状图") =====
+    st.markdown("**🗺 12 点位 × 未来 10 天 可作业率矩阵**")
+    rows = point_weather_matrix(10)
+    if rows:
+        import pandas as pd
+        df_mx = pd.DataFrame(rows)
+        if not df_mx.empty:
+            # 透视: 行=点位, 列=日期
+            pivot = df_mx.pivot_table(index="点位", columns="日期", values="可作业率%", fill_value=None)
+            # 按甘肃检修区域排序
+            region_order = ["兰州", "酒泉", "嘉峪关", "张掖", "武威", "定西",
+                            "平凉", "庆阳", "临夏", "合作", "天水", "陇南"]
+            pivot = pivot.reindex([p for p in region_order if p in pivot.index])
+            st.dataframe(pivot.style.background_gradient(
+                cmap="RdYlGn", vmin=40, vmax=100
+            ).format("{:.0f}"), use_container_width=True)
+            st.caption("绿=可作业率高 红=受限严重. 点位按甘肃检修区域分组; "
+                       "查具体某天某点是否适合高空/吊装作业 → 直接看格子.")
+    else:
+        st.caption("未来 10 天天气数据未覆盖, 暂无矩阵.")
+
+    # ===== ③ 当月检修计划 × 天气风险清单(原有, 保留向后兼容) =====
+    risks = weather_maint_risk(df_maint, target_year, target_month)
+    if risks:
+        hi = [x for x in risks if x[5] in ("高", "中")]
+        if hi:
+            with st.expander(f"📋 展开: 当月全部风险清单({len(risks)} 条, 其中高/中风险 {len(hi)} 条)"):
+                for equip, sd, ed, bad, total, lvl in hi[:15]:
+                    st.markdown(f"- **{lvl}** | {equip} | {sd}~{ed} | {bad}/{total}h")
+                st.caption("清单只列'高/中风险'档; '按期'档在 ① 决策矩阵中已聚合.")
+
+    # ===== ④ 外送双重风险(雷暴 + 断面检修) =====
+    if df_sec is not None and not df_sec.empty and "月份" in df_sec.columns:
+        try:
+            conn = pymysql.connect(**DB_CONFIG)
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(SUM(雷暴),0) FROM weather_hourly "
+                        "WHERE 时间 > NOW() AND 时间 < DATE_ADD(NOW(), INTERVAL 11 DAY)")
+            thunder_h = int(cur.fetchone()[0] or 0)
+            conn.close()
+            sec_m = df_sec[df_sec["月份"].astype(str) == f"{target_year}-{target_month:02d}"]
+            sec_maint = sec_m[sec_m.astype(str).apply(lambda r: r.str.contains("检修").any(), axis=1)] \
+                if not sec_m.empty else pd.DataFrame()
+            if thunder_h > 20 and not sec_maint.empty:
+                st.error(f"🔴 外送双重风险: 未来 10 天雷暴 {thunder_h} 小时 + 当月 {len(sec_maint)} 个断面检修, "
+                         f"雷暴可能叠加检修限额, 外送窗口需重点盯防.")
+            elif thunder_h > 20:
+                st.info(f"未来 10 天雷暴 {thunder_h} 小时偏多, 关注外送线路跳闸风险(当月无断面检修冲突).")
+        except Exception:
+            pass
+
 
 # ==================== 第一步: 加权检修影响(容量权重) ====================
 def predict_weighted_impact(df, target_year, target_month):
@@ -688,10 +1083,10 @@ def render_report():
         st.markdown(
             f'<div style="background:#f0f4f8;padding:18px 20px;border-radius:8px;border-left:4px solid #185FA5">'
             f'<div style="font-size:42px;font-weight:700;color:#185FA5;line-height:1">{point}'
-            f'<span style="font-size:18px;color:#888;margin-left:8px">± 1项</span></div>'
+            f'<span style="font-size:18px;color:#888;margin-left:8px">项</span></div>'
             f'<div style="color:#666;margin-top:6px;font-size:13px">'
             f'预计 {target} 发电设备检修项数<br>'
-            f'置信区间(80%): <b>{lo} ~ {hi} 项</b></div></div>',
+            f'历史波动范围: <b>{lo} ~ {hi} 项</b></div></div>',
             unsafe_allow_html=True,
         )
         st.caption(f"📐 方法: {fc['method']}")
@@ -713,6 +1108,30 @@ def render_report():
             else:
                 st.success(f"✅ 实际落在预测区间内（偏差 {pct:+.0f}%）")
 
+        # 已知跨月续检(底仓): 上月已披露、本月仍在修——预测时应作为确定底仓, 不计入"新增"
+        try:
+            _ts = pd.Timestamp(year=target_year, month=target_month, day=1)
+            _cont = df[(df["年"].astype(int) == target_year)
+                      & (df["开始日期_dt"] < _ts) & (df["结束日期_dt"] >= _ts)]
+            if not _cont.empty:
+                _cn = len(_cont)
+                _ex = "、".join(
+                    (_cont["申请单位"].astype(str) + "·" + _cont["停电设备"].astype(str)).head(3).tolist()
+                )
+                st.info(f"🔗 已知跨月续检(底仓): 本月有 **{_cn}** 项检修从上月延续(已披露、确定发生), "
+                         f"预测下月时应作为『已知底仓』单列, 不再计入新增预测。示例: {_ex} 等。")
+                # 把底仓明细展开, 方便用户核对这23项具体落在哪些设备
+                _cols = [c for c in ["申请单位", "停电设备", "检修级别", "开始日期", "结束日期",
+                                     "工作内容", "设备类型", "所属地区"] if c in _cont.columns]
+                _disp = _cont[_cols].sort_values(["所属地区" if "所属地区" in _cols else "申请单位",
+                                                  "开始日期"], na_position="last").copy()
+                _disp.insert(0, "底仓标记", "✅ 跨月续检")
+                with st.expander(f"📋 查看 {_cn} 项跨月续检明细（底仓）", expanded=False):
+                    st.caption("以下为『上月已开始、本月仍在修』的已披露检修；预测下月新增时不应重复计入。")
+                    st.dataframe(_disp, use_container_width=True, hide_index=True, height=min(350, 35 * (_cn + 1)))
+        except Exception:
+            pass
+
         # 第一步: 加权检修影响指数指标卡
         if w_avg is not None:
             st.markdown(
@@ -721,7 +1140,9 @@ def render_report():
                 f'<div style="font-size:22px;font-weight:700;color:#2e7d32;line-height:1">{w_avg:.0f}'
                 f'<span style="font-size:12px;color:#666;margin-left:6px">加权影响指数 (历史同期均值)</span></div>'
                 f'<div style="color:#666;font-size:12px;margin-top:4px">'
-                f'发电机组 {wstats["gen"]} 项 · 主变 {wstats["trans"]} 项 · 合计权重损失 {wstats["weighted"]:.0f}</div>'
+                f'发电机组 {wstats["gen"]} 项 · 主变 {wstats["trans"]} 项 · 合计权重损失 {wstats["weighted"]:.0f}'
+                f'<br><span style="font-size:11px">（{w_avg:.0f}=历史同月「每月」平均影响指数；'
+                f'{wstats["weighted"]:.0f}=同月全部记录权重合计，两者口径不同，非矛盾）</span></div>'
                 f'</div>', unsafe_allow_html=True)
     with c2:
         import plotly.graph_objects as go
@@ -775,6 +1196,8 @@ def render_report():
                 if row.get("所属地区"):
                     loc += f"（{row['所属地区']}）"
                 cyc = f"{row['平均周期月']}月" if pd.notna(row.get("平均周期月")) else "短间隔"
+                if pd.notna(row.get("历史次数")) and int(row["历史次数"]) < 5:
+                    cyc = "样本不足"
                 nxt = row.get("下次预计") or "—"
                 stt = row.get("状态", "")
                 if stt:
@@ -801,12 +1224,27 @@ def render_report():
             td.columns = ["设备类型", "次数"]
             st.dataframe(td, use_container_width=True, hide_index=True, height=180)
 
-        # 重复披露设备
+        # 重复披露设备(仅展示真实重复≥2次的设备, 单次出现无规律意义)
         if repeat_equip is not None and len(repeat_equip) > 0:
-            st.markdown("**跨期重复披露设备**")
-            rq = repeat_equip.reset_index()
-            rq.columns = ["线路/设备", "重复次数"]
-            st.dataframe(rq, use_container_width=True, hide_index=True, height=140)
+            rq = repeat_equip[repeat_equip >= 2]
+            if len(rq) > 0:
+                st.markdown("**跨期重复披露设备（同设备跨期出现≥2次，具备规律性）**")
+                rq = rq.reset_index()
+                rq.columns = ["线路/设备", "重复次数"]
+                st.dataframe(rq, use_container_width=True, hide_index=True, height=140)
+
+        # 逾期设备清单(检出概率上调 + 超6月人工确认)
+        if "状态" in equip_groups.columns:
+            overdue = equip_groups[equip_groups["状态"].astype(str).str.contains("已逾期")]
+            if not overdue.empty:
+                st.markdown("**⏰ 逾期设备清单（检出概率上调）**")
+                st.caption("以下设备『下次预计』已逾期, 模型将其检修检出概率上调; "
+                           "逾期>6月建议人工确认是否漏披露或已取消。")
+                st.dataframe(overdue[["停电设备", "申请单位", "上次检修", "下次预计", "状态", "历史次数"]],
+                             use_container_width=True, hide_index=True, height=200)
+                over6 = overdue[overdue["状态"].astype(str).str.contains(r"已逾期([6-9]|1\d|2\d)月")]
+                if not over6.empty:
+                    st.warning(f"⚠ {len(over6)} 台设备逾期超过 6 个月, 建议人工核对是否漏披露。")
 
     with c4:
         st.markdown("**重点线路历史检修明细**")
@@ -898,6 +1336,9 @@ def render_report():
         st.info(f"该月({target})暂无常规最大发电能力/最大用电负荷数据(披露报告覆盖 2024-10~2026-07 + 月度平衡 2026-09), 备用率模块待补全")
 
     st.write("---")
+
+    # ===== 📦 供给结构最新实测总览(用户指定的装机披露 + 交易计划两份数据源) =====
+    render_latest_structure(df_disc, df_trade, target_year, target_month)
 
     # ===== 📈 月度供需预测（出力结构, 上级要求②）=====
     render_supply_demand(df_disc, target_year, target_month)
@@ -1046,22 +1487,39 @@ def render_report():
             )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # 总体提示
-    if risk == "高":
+    # 建议依据(预测页): 用 risk(高峰月)代理检修偏多; 外送高位=实际净送出>预测105%
+    maint_high = (risk == "高")
+    out_high = False
+    if df_trade is not None and not df_trade.empty and "净送出_亿kWh" in df_trade.columns:
+        fc_out_rp = seasonal_forecast_value(df_trade, "净送出_亿kWh", target_year, target_month)
+        rr = df_trade[df_trade["月份"] == target]
+        if fc_out_rp and not rr.empty:
+            oa = pd.to_numeric(rr["净送出_亿kWh"].iloc[0], errors="coerce")
+            if pd.notna(oa) and fc_out_rp["point"]:
+                out_high = oa > fc_out_rp["point"] * 1.05
+
+    # 总体提示(基于有依据的组合: 检修总量偏高 + 外送高位, 而非低置信度的周节奏)
+    if maint_high and out_high:
         st.info(
-            f"💼 **建议**: {target_month}月属检修高峰, 供给偏紧风险大, "
-            f"重点跟踪 **{peak_week if peak_week else '集中时段'}** 价格波动, "
-            "建议中旬前观望, 末旬可考虑建仓")
+            f"💼 **提示**: {target_month}月检修偏多且外送处于高位, 省内供给双重收紧, "
+            f"现货端偏多思路为主; 重点跟踪 **{peak_week if peak_week else '检修集中时段'}** "
+            "(月内节奏仅供参考, 置信度较低)。")
+    elif maint_high:
+        st.info(
+            f"💼 **提示**: {target_month}月检修偏多, 供给端承压, 关注现货上行; "
+            f"外送可控。月内节奏(**{peak_week if peak_week else '集中时段'}**)仅作参考。")
     else:
         st.info(
-            f"💼 **建议**: {target_month}月属检修低谷/过渡, 整体供需宽松, "
-            "现货价格大概率不冲高, 月度合约可争取更优条款")
+            f"💼 **提示**: {target_month}月检修处同期正常/偏低水平, 供给相对宽松, "
+            "现货以中性策略为主; 月度合约谈判空间相对宽松(仅供参考)。")
 
     st.caption(
         "⚠️ 本报告基于历史规律生成, 实际检修计划以甘肃省电力市场信息披露平台每月发布的正式文件为准。"
     )
 
-    # 报告下载
+    # 报告下载（🌤 天气-检修适配已移至「📈 已披露复盘」页, 作为第 12 项子节）
+
+
     st.write("---")
     _, btn_col, _ = st.columns([3, 1, 3])
     with btn_col:
@@ -1098,8 +1556,8 @@ def build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equ
     lines += [
         "## ① 总量预测",
         "",
-        f"- 预计检修项数: **{point} ± 1 项**",
-        f"- 置信区间(80%): {lo} ~ {hi} 项",
+        f"- 预计检修项数: **{point} 项**",
+        f"- 历史波动范围: {lo} ~ {hi} 项",
         f"- 季节属性: {season}",
         f"- 供给收紧风险: {risk}",
     ]
@@ -1121,14 +1579,19 @@ def build_report_md(target, point, lo, hi, season, risk, signals, peak_week, equ
                 loc += str(row["变电站"])
             if row.get("所属地区"):
                 loc += f"（{row['所属地区']}）"
-            cyc = f"{row['平均周期月']}" if pd.notna(row.get("平均周期月")) else "短间隔"
+            cyc = (f"{row['平均周期月']}月" if pd.notna(row.get("平均周期月"))
+                   else "短间隔")
+            if pd.notna(row.get("历史次数")) and int(row["历史次数"]) < 5:
+                cyc = "样本不足"
             nxt = row.get("下次预计") or "—"
             stt = row.get("状态", "")
             lines.append(f"| {row['停电设备']} | {loc or '—'} | {int(row['历史次数'])} | {cyc} | {nxt} | {stt or '—'} | {row['主要级别']} | {row['申请单位']} |")
     if repeat_equip is not None and len(repeat_equip) > 0:
-        lines += ["", "**跨期重复披露设备:**", ""]
-        for equip, cnt in repeat_equip.items():
-            lines.append(f"- {equip} (重复 {int(cnt)} 次)")
+        reps = [(e, int(c)) for e, c in repeat_equip.items() if int(c) >= 2]
+        if reps:
+            lines += ["", "**跨期重复披露设备（≥2次，具备规律性）:**", ""]
+            for equip, cnt in reps:
+                lines.append(f"- {equip} (重复 {cnt} 次)")
     lines += ["", "## ③ 时间分布", "",
               f"- 集中时段: {peak_week if peak_week else '数据不足'}"]
     lines += ["", "## ④ 交易解读", ""]
@@ -1170,6 +1633,64 @@ def _conf_label(r):
     if rel < 0.6:
         return "中"
     return "低"
+
+def render_latest_structure(df_disc, df_trade, target_year, target_month):
+    """用户明确关心的两份数据源(发电机组装机披露 + 交易计划)最新月实测总览卡。
+    把月度披露报告(装机/上网电量)与月度交易计划(外送/受入)的最新实际月聚合成一屏指标卡,
+    与上方季节性预测互为印证。数据已在 power_maintenance 库(月度披露报告 / 月度交易计划表)。
+    """
+    st.markdown("### 📦 供给结构最新实测（装机 · 发电量 · 外送）")
+    st.caption("数据来源: 月度披露报告(装机/上网电量) + 月度交易计划(外送/受入)。"
+               "展示各自最新已披露月份的实际值, 与上方季节性预测互为印证。")
+    d_disc = df_disc.dropna(subset=["月份"]).copy() if df_disc is not None else pd.DataFrame()
+    if d_disc.empty:
+        st.info("暂无披露数据, 本面板待补"); return
+    latest_d = d_disc.sort_values("月份")["月份"].iloc[-1]
+    row = d_disc[d_disc["月份"] == latest_d].iloc[0]
+
+    def g(col):
+        v = row.get(col)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    st.markdown(f"**装机容量（截至 {latest_d}，万kW）**")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1: st.metric("总装机", f"{(g('装机总_万kW') or 0):.0f}")
+    with c2: st.metric("火电", f"{(g('装机_火电_万kW') or 0):.0f}")
+    with c3: st.metric("水电", f"{(g('装机_水电_万kW') or 0):.0f}")
+    with c4: st.metric("风电", f"{(g('装机_风电_万kW') or 0):.0f}")
+    with c5: st.metric("太阳能", f"{(g('装机_光电_万kW') or 0):.0f}")
+    with c6: st.metric("储能", f"{(g('装机_独立储能_万kW') or 0):.0f}")
+
+    st.markdown(f"**当月上网发电量（{latest_d}，亿kWh）**")
+    e1, e2, e3, e4, e5 = st.columns(5)
+    with e1: st.metric("合计", f"{(g('上网电量当月_亿kWh') or 0):.0f}")
+    with e2: st.metric("火电", f"{(g('上网_火电_亿kWh') or 0):.0f}")
+    with e3: st.metric("水电", f"{(g('上网_水电_亿kWh') or 0):.0f}")
+    with e4: st.metric("风电", f"{(g('上网_风电_亿kWh') or 0):.0f}")
+    with e5: st.metric("太阳能", f"{(g('上网_光电_亿kWh') or 0):.0f}")
+
+    if df_trade is not None and not df_trade.dropna(subset=["月份"]).empty:
+        d_trade = df_trade.dropna(subset=["月份"]).copy()
+        lt = d_trade.sort_values("月份")["月份"].iloc[-1]
+        tr = d_trade[d_trade["月份"] == lt].iloc[0]
+
+        def gt(col):
+            v = tr.get(col)
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        st.markdown(f"**外送与受入（{lt}，亿kWh）**")
+        o1, o2, o3, o4 = st.columns(4)
+        with o1: st.metric("净送出", f"{(gt('净送出_亿kWh') or 0):.0f}")
+        with o2: st.metric("中长期外送", f"{(gt('中长期外送_亿kWh') or 0):.0f}")
+        with o3: st.metric("外送(年+月)", f"{((gt('外送_年度_亿kWh') or 0) + (gt('外送_月度_亿kWh') or 0)):.0f}")
+        with o4: st.metric("外购(受入)", f"{(gt('外购电_亿kWh') or 0):.0f}")
+
 
 def render_supply_demand(dd, target_year, target_month):
     """② 月度供需预测(出力结构): 新能源/火电/水电/总发电/全社会负荷 + 供需关系 + 置信度。
@@ -1246,7 +1767,8 @@ def render_supply_demand(dd, target_year, target_month):
     if gen_fc and load_fc:
         gap = gen_fc["point"] - load_fc["point"]
         if gap > 0:
-            st.success(f"📊 供需关系: 预计发电量超出负荷约 **{gap:.0f} 亿kWh**, 省内供给充裕, 富余电力可外送/储能。")
+            st.success(f"📊 供需关系: 预计发电量超出负荷约 **{gap:.0f} 亿kWh**, 省内供需紧平衡、安全垫偏薄, "
+                       f"富余电量有限(外送已按净额口径单列, 不重复计算)。")
         else:
             st.warning(f"📊 供需关系: 预计发电量低于负荷约 **{abs(gap):.0f} 亿kWh**, 存在缺口, 需外购或压减外送。")
     st.caption("注: '发电量'以省级结算口径上网电量近似; '负荷'以全社会用电量(电量口径)近似, 非瞬时功率。精确MW需新能源功率预测系统(待接入)。")
@@ -1265,6 +1787,18 @@ def render_outward(df_trade, target_year, target_month, risk):
         ("预计中长期外送", "中长期外送_亿kWh"),
         ("预计外购(受入)", "外购电_亿kWh"),
     ]
+    # fallback: 交易计划缺该月历史时, 用联络线分时日电量加总推算净送出(实测代理)
+    tl_net = None
+    try:
+        tl = load_tieline()
+        if tl is not None and not tl.empty and "日电量_万kWh" in tl.columns:
+            tl_m = tl[tl["月份"].astype(str) == target_str]
+            if not tl_m.empty:
+                s = pd.to_numeric(tl_m["日电量_万kWh"], errors="coerce").sum()
+                if pd.notna(s) and s > 0:
+                    tl_net = round(float(s) / 1e4, 1)
+    except Exception:
+        pass
     cards = st.columns(3)
     preds = {}
     for (lab, col), c in zip(cols_cfg, cards):
@@ -1274,6 +1808,9 @@ def render_outward(df_trade, target_year, target_month, risk):
             if r:
                 st.metric(lab, f"{r['point']} 亿kWh",
                           help=f"区间 {r['lo']}~{r['hi']} 亿kWh; 置信度{_conf_label(r)}; {r.get('method','—')}")
+            elif col == "净送出_亿kWh" and tl_net is not None:
+                st.metric(lab, f"{tl_net} 亿kWh",
+                          help="交易计划无该月历史, 由联络线分时日电量加总推算(实测代理, 非预测)")
             else:
                 st.info(f"{target_month} 月无历史同期{lab}数据")
 
@@ -1421,8 +1958,31 @@ def render_review():
         except Exception:
             return False
 
-    out_cnt = int(sec_m["正向限额"].apply(_poslim).sum()) if not sec_m.empty else 0
-    out_win = "较宽" if out_cnt >= 3 else ("偏窄" if not sec_m.empty else "无断面数据")
+    def _fwd_num(v):
+        s = str(v).replace("无", "").replace("—", "").replace("~", "").replace("-", "").strip()
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    # 各断面当月『最低』正向限额(卡脖子值); 并检测时段性收紧(同月内最低<<最高)
+    per_sec = {}
+    if not sec_m.empty:
+        for name, g in sec_m.groupby("断面名称"):
+            vals = g["正向限额"].apply(_fwd_num)
+            pos = vals[vals > 0]
+            if len(pos):
+                per_sec[name] = (float(pos.min()), float(pos.max()))
+    out_cnt = len(per_sec)
+    out_win = "较宽" if out_cnt >= 3 else ("偏窄" if per_sec else "无断面数据")
+    # 局部收紧: 某断面当月最低限额明显低于其当月最高(检修致时段性收紧)
+    tight = [(n, lo, hi) for n, (lo, hi) in per_sec.items()
+             if hi > 0 and lo < 0.7 * hi and lo < 700]
+    out_note = ""
+    if tight and out_win == "较宽":
+        out_win = "较宽·局部收紧"
+        out_note = "⚠ 注意: " + "、".join(f"{n}(降至{int(lo)})" for n, lo, hi in tight) \
+                   + " 当月因检修时段性收紧, 外送需避开其紧张窗口"
     # 供需: 已披露月用实测上网电量 vs 全社会用电量
     supply, supply_src = "数据不足", ""
     if df_disc is not None and not df_disc.empty:
@@ -1431,7 +1991,8 @@ def render_review():
             g_act = pd.to_numeric(ar_disc["上网电量当月_亿kWh"].iloc[0], errors="coerce")
             l_act = pd.to_numeric(ar_disc["全社会用电量当月_亿kWh"].iloc[0], errors="coerce")
             if pd.notna(g_act) and pd.notna(l_act):
-                supply = "充裕·可外送" if (g_act - l_act) > 0 else "偏紧·需外购"
+                # 措辞保守化: 发电量略高于负荷 ≠ 充裕; 外送已按净额口径单列, 不在此重复"可外送"
+                supply = "紧平衡·安全垫薄" if (g_act - l_act) > 0 else "偏紧·需外购"
                 supply_src = "实测"
 
     n_maint = len(sub)
@@ -1442,30 +2003,59 @@ def render_review():
         st.metric("受检修影响断面", f"{sec_aff} 个",
                   help="当月断面限额备注含『检修』的通道数, 直接卡外送窗口")
     with c3:
-        st.metric("外送窗口", out_win,
-                  help=(f"{out_cnt} 个断面正向有容量" if not sec_m.empty else "该月无断面数据"))
+        _out_help = (f"{out_cnt} 个断面正向有容量" if not sec_m.empty else "该月无断面数据")
+        if out_note:
+            _out_help += "；" + out_note
+        st.metric("外送窗口", out_win, help=_out_help)
     with c4:
-        st.metric("供需关系", supply, help=f"上网电量 vs 全社会用电量（{supply_src}）")
+        _supply_help = ("上网电量 vs 全社会用电量" + (f"（{supply_src}）" if supply_src else "")
+                       + "；发电量仅略高于负荷时为紧平衡, 安全垫薄")
+        st.metric("供需关系", supply, help=_supply_help)
     st.markdown(
         f'<div style="background:#EAF1F8;padding:12px 16px;border-radius:8px;'
         f'border-left:4px solid #185FA5;margin-top:6px">'
         f'<div style="font-size:13px;color:#333">🧭 <b>{target}</b> 已披露实测：检修 {n_maint} 项 · '
         f'{sec_aff} 个外送断面受检修影响 · 外送窗口{out_win} · 供需{supply}（{supply_src}）。</div></div>',
         unsafe_allow_html=True)
+    # 检修量口径可复核: 合并规则 + 分项计数(与PDF分项加总可能±1, 源于跨表重复披露)
+    cat_counts = sub["类别"].value_counts() if "类别" in sub.columns else pd.Series(dtype=int)
+    cat_line = " · ".join(f"{k}:{int(v)}" for k, v in cat_counts.items()) if len(cat_counts) else ""
+    st.caption(
+        f"检修量口径: 同(申请单位+设备)当月合并为1项, 封网/拆网各计1项; 与PDF分项加总可能±1"
+        f"(跨表重复披露所致, 如茅泉Ⅱ线跨表、封网/拆网拆两条)。"
+        + (f" 分项计数(按类别): {cat_line}。" if cat_line else ""))
     st.write("---")
 
     # ---------- 1. 一句话交易提示卡 ----------
     n = len(sub)
     fc = seasonal_forecast(df, ty, tm)
-    ratio = (n / fc["point"]) if (fc and fc["point"]) else 1.0
+    # 压力指数分母用『历史同期实际均值』(非预测值), 避免循环论证
+    hist_same = df[df["月"] == tm].groupby("披露月份").size()
+    hist_same_mean = float(hist_same.mean()) if len(hist_same) else None
+    ratio = (n / hist_same_mean) if (hist_same_mean and hist_same_mean > 0) else 1.0
     reg = sub["所属地区"].replace("其他", pd.NA).dropna()
     top_region_name = reg.value_counts().index[0] if not reg.empty else "—"
     out_actual = None
+    out_src = ""
     if df_trade is not None and not df_trade.empty and "净送出_亿kWh" in df_trade.columns \
             and "月份" in df_trade.columns:
         rr = df_trade[df_trade["月份"] == target]
         if not rr.empty:
             out_actual = pd.to_numeric(rr["净送出_亿kWh"].iloc[0], errors="coerce")
+            out_src = "交易计划实测"
+    # fallback: 交易计划缺该月时, 用联络线分时日电量加总推算外送(万kWh→亿kWh)
+    if (out_actual is None or pd.isna(out_actual)):
+        try:
+            tl = load_tieline()
+            if tl is not None and not tl.empty and "日电量_万kWh" in tl.columns:
+                tl_m = tl[tl["月份"].astype(str) == target]
+                if not tl_m.empty:
+                    s = pd.to_numeric(tl_m["日电量_万kWh"], errors="coerce").sum()
+                    if pd.notna(s) and s > 0:
+                        out_actual = round(float(s) / 1e4, 1)
+                        out_src = "联络线分时推算"
+        except Exception:
+            pass
     fc_out = seasonal_forecast_value(df_trade, "净送出_亿kWh", ty, tm) \
         if (df_trade is not None and not df_trade.empty) else None
     out_high = (out_actual is not None and fc_out and fc_out["point"]
@@ -1487,7 +2077,8 @@ def render_review():
         f'<div style="font-size:18px;font-weight:700;color:{color}">{tag}</div>'
         f'<div style="color:#333;margin-top:8px;font-size:14px">{advice}</div>'
         f'<div style="color:#666;margin-top:6px;font-size:12px">本月检修 {n} 项 · '
-        f'最高频地区 {top_region_name} · 外送实测 {out_actual if out_actual is not None else "—"} 亿kWh</div>'
+        f'最高频地区 {top_region_name} · 外送实测 {out_actual if out_actual is not None else "—"} 亿kWh'
+        f'{("（" + out_src + "）") if out_src else ""}</div>'
         f'</div>', unsafe_allow_html=True)
 
     # ---------- 2. 检修压力日历（每日热力图） ----------
@@ -1512,19 +2103,23 @@ def render_review():
     # ---------- 3. 关键检修时间条（甘特） ----------
     st.markdown("### 🗓 关键检修时间条")
     st.caption("横条=每条独立检修事件; 颜色越深=影响权重越高(机组/主变>线路/母线); "
-               "不合并同设备多事件——多事件 = 该设备当月修得勤; 悬停可见申请单位。")
+               "y 轴带『厂·设备』双标签——同名设备(如多个厂的 #2机组)是不同物理机组, "
+               "不是同一台机器重复; 悬停可见完整申请单位。")
     g = sub.dropna(subset=["开始日期_dt"]).copy()
     g = g.sort_values(["权重", "开始日期_dt"], ascending=[False, True]).head(20)
     if not g.empty:
         import plotly.express as px
         g["结束_dt"] = g["结束日期_dt"].fillna(g["开始日期_dt"])
-        g["设备简"] = g["停电设备"].astype(str).str.slice(0, 18)
-        g["申请单位简"] = g["申请单位"].astype(str).str.slice(0, 14)
-        fig = px.timeline(g, x_start="开始日期_dt", x_end="结束_dt", y="设备简",
+        # y 轴标签 = 厂名 + 设备名(避免不同厂的同名设备看起来像同一条)
+        g["厂简"] = g["申请单位"].astype(str).str.slice(0, 10)
+        g["设备简"] = g["停电设备"].astype(str).str.slice(0, 14)
+        g["y轴标签"] = g["厂简"] + " · " + g["设备简"]
+        fig = px.timeline(g, x_start="开始日期_dt", x_end="结束_dt", y="y轴标签",
                           color="权重", color_continuous_scale="OrRd",
-                          hover_data={"申请单位简": True, "权重": True, "设备简": False,
+                          hover_data={"申请单位": True, "停电设备": True, "权重": True,
+                                      "y轴标签": False,
                                       "开始日期_dt": "|%m-%d", "结束_dt": "|%m-%d"})
-        fig.update_layout(height=max(300, 22 * len(g) + 60),
+        fig.update_layout(height=max(320, 26 * len(g) + 60),
                           margin=dict(l=10, r=10, t=10, b=30), showlegend=False,
                           xaxis_title=f"{ty}年{tm}月", coloraxis_colorbar_title="影响权重")
         st.plotly_chart(fig, use_container_width=True)
@@ -1532,16 +2127,42 @@ def render_review():
         st.info("该月无带起止日期的检修记录。")
 
     # ---------- 4. 高影响检修清单 ----------
-    st.markdown("### 📋 高影响检修清单（按影响等级）")
+    st.markdown("### 📋 高影响检修清单（按检修级别 + 持续天数）")
     st.caption("表格按(申请单位+设备)合并汇总, 每行=一组设备; '当月次数'列=该设备当月独立记录条数; "
-               "'影响区域'为该厂站所属地市。多事件的具体时间分布可看上方的检修甘特图。")
+               "'影响区域'为该厂站所属地市; '持续天数'='结束-开始'天数(缺结束日期用检修天数)。"
+               "排序: 检修级别(A>B>C>D>改造/例行…)优先, 同级再比持续天数 —— "
+               "A级40天大修自然排在D级10天小修之前。多事件时间分布见上方甘特图。")
     lst = sub.copy()
-    lst["影响等级"] = lst["权重"].map(lambda w: "高" if w >= 4 else ("中" if w == 3 else "低"))
-    # 合并逻辑: 按(申请单位, 停电设备), 而不是只按设备名(避免不同电厂同名机组被错误合并)
-    grp = lst.sort_values("权重", ascending=False).drop_duplicates(
+    LEVEL_RANK = {"A级检修": 5, "B级检修": 4, "C级检修": 3, "改造大修": 3, "D级检修": 2,
+                  "例行检修": 2, "检修预试": 2, "基建接入": 2, "消缺": 1, "其他": 1}
+
+    def _sev(lv, w):
+        if lv in LEVEL_RANK:
+            return LEVEL_RANK[lv]
+        return 3 if w >= 4 else (2 if w == 3 else 1)
+
+    def _days(r):
+        s, e = r.get("开始日期_dt"), r.get("结束日期_dt")
+        if pd.notna(s) and pd.notna(e):
+            return max(1, int((e - s).days))
+        if pd.notna(r.get("检修天数")):
+            try:
+                return int(float(r["检修天数"]))
+            except Exception:
+                return None
+        return None
+
+    lst["持续天数"] = lst.apply(_days, axis=1)
+    lst["等级"] = lst["检修级别"].astype(str).fillna("其他")
+    lst["_sev"] = lst.apply(lambda r: _sev(r["等级"], r["权重"]), axis=1)
+    # 合并逻辑: 按(申请单位, 停电设备), 避免不同电厂同名机组被错误合并
+    grp = lst.sort_values(["_sev", "持续天数", "权重"], ascending=False).drop_duplicates(
         subset=["申请单位", "停电设备"], keep="first")
     cnt = sub.groupby(["申请单位", "停电设备"]).size().rename("当月次数")
     grp = grp.merge(cnt, on=["申请单位", "停电设备"], how="left")
+    grp = grp.drop(columns=["持续天数"], errors="ignore")
+    days_max = lst.groupby(["申请单位", "停电设备"])["持续天数"].max().rename("持续天数")
+    grp = grp.merge(days_max, on=["申请单位", "停电设备"], how="left")
 
     def fmt_range(start, end):
         s = start.strftime("%m-%d") if pd.notna(start) else "—"
@@ -1549,14 +2170,15 @@ def render_review():
         return f"{s} 至 {e}" if s != "—" else "—"
 
     grp["检修时间"] = grp.apply(lambda r: fmt_range(r["开始日期_dt"], r["结束日期_dt"]), axis=1)
-    grp = grp.sort_values(["权重", "开始日期_dt"], ascending=[False, True])
+    grp = grp.sort_values(["_sev", "持续天数", "权重"], ascending=[False, False, False])
     show = grp[["停电设备", "申请单位", "检修时间", "所属地区",
-                "设备类型", "影响等级", "当月次数"]].copy()
+                "设备类型", "等级", "持续天数", "当月次数"]].copy()
     show = show.rename(columns={"停电设备": "线路/设备", "所属地区": "影响区域",
                                   "申请单位": "申请单位/厂站"})
     show["影响区域"] = show["影响区域"].replace("其他", "—")
+    show["持续天数"] = show["持续天数"].apply(lambda v: f"{int(v)}天" if pd.notna(v) else "—")
     show = show[["线路/设备", "申请单位/厂站", "检修时间",
-                  "影响区域", "设备类型", "影响等级", "当月次数"]]
+                  "影响区域", "设备类型", "等级", "持续天数", "当月次数"]]
     st.dataframe(show, use_container_width=True, hide_index=True, height=360)
 
     # ---------- 5. 检修与电源结构（有数据才显示, 无数据静默隐藏） ----------
@@ -1628,20 +2250,31 @@ def render_review():
         st.success("🟢 检修与外送均处于正常区间, 供给相对宽松。")
 
     # ---------- 8. 模型回测 ----------
-    st.markdown("### 🎯 模型回测（实际 vs 预测）")
+    st.markdown("### 🎯 模型回测（实际 vs 预测 + 朴素基线）")
+    st.caption("评估模型是否『比拍脑袋强』: 加入两个朴素基线(上月延续 / 同月均值)对照; "
+               "点估计误差大属正常, 关键看方向准确率与是否优于基线。")
     hist = df.groupby("披露月份").size()
     months = sorted(hist.index.tolist())[-12:]
     rows = []
+    prev_actual = None
     for m in months:
         y, mo = int(m[:4]), int(m[5:7])
         pr = seasonal_forecast(df, y, mo)
-        rows.append({"月份": m, "实际": int(hist[m]),
-                     "预测": pr["point"] if pr and pr["point"] else None})
+        point = pr["point"] if pr and pr["point"] is not None else None
+        lo = pr["lo"] if pr else None
+        hi = pr["hi"] if pr else None
+        act = int(hist[m])
+        same = df[df["月"] == mo]
+        same_others = same[same["披露月份"] != m].groupby("披露月份").size()
+        base_same = float(same_others.mean()) if len(same_others) else None
+        rows.append({"月份": m, "实际": act, "预测": point,
+                     "区间下": lo, "区间上": hi,
+                     "基线_上月": prev_actual, "基线_同月": base_same})
+        prev_actual = act
     back = pd.DataFrame(rows)
     if back.empty:
         st.info("历史披露月份不足, 无法做回测。")
     else:
-        # 方向准确率(模型擅长方向判断, 是真正价值所在)
         b2 = back.dropna(subset=["预测"]).copy()
         if not b2.empty:
             b2["实际方向"] = b2["实际"].diff().fillna(0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
@@ -1651,21 +2284,41 @@ def render_review():
             dir_rate = (n_correct / n_valid * 100) if n_valid else 0
             st.success(f"✅ 模型方向准确率 {n_correct}/{n_valid} = {dir_rate:.0f}%"
                        "（判断'当月检修量相对上月是升高还是降低'）")
-        # 点估计偏差默认折叠, 避免展示大数字误导
-        with st.expander("▶ 查看点估计详情（用于复盘, 日常可忽略）"):
-            st.caption("本模型为**方向性参考**, 点估计误差较大属正常; 数字偏大是季节性方法本身局限, "
-                       "并非建模错误。如需点估计精度, 需替换为含外生变量的回归模型。")
-            fig = go.Figure()
-            fig.add_bar(x=back["月份"], y=back["实际"], name="实际", marker_color="#185FA5")
-            fig.add_scatter(x=back["月份"], y=back["预测"], mode="lines+markers",
-                            name="预测", line=dict(color="#D85A30"))
-            fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=60),
-                              legend_orientation="h", yaxis_title="检修项数")
-            st.plotly_chart(fig, use_container_width=True)
+        with st.expander("▶ 点估计精度与基线对比（复盘用, 日常可忽略）"):
+            st.caption("本模型为方向性参考, 点估计误差较大属正常。下列指标用于判断是否『比朴素基线强』——"
+                       "若模型 MAE 不优于基线, 说明该预测不值得单独信赖, 应直接采用基线。")
             if not b2.empty:
                 b2["偏差%"] = (b2["实际"] - b2["预测"]) / b2["预测"] * 100
-                mae = b2["偏差%"].abs().mean()
-                st.dataframe(b2[["月份", "实际", "预测", "偏差%"]].round(0),
+                b2["MAE"] = b2["偏差%"].abs()
+                mae = b2["MAE"].mean()
+
+                def _mae_base(col):
+                    s = b2.dropna(subset=[col])
+                    return float(((s["实际"] - s[col]).abs()).mean()) if len(s) >= 2 else None
+
+                mae_prev = _mae_base("基线_上月")
+                mae_same = _mae_base("基线_同月")
+                cov = float(((b2["实际"] >= b2["区间下"]) & (b2["实际"] <= b2["区间上"])).mean() * 100)
+                st.markdown(f"- 模型点估计 MAE(=MAPE): **{mae:.0f}%**")
+                if mae_prev and mae_same:
+                    st.markdown(f"- 朴素基线 MAE — 上月延续: **{mae_prev:.0f}%** ｜ 同月均值: **{mae_same:.0f}%**")
+                    best = min(mae, mae_prev, mae_same)
+                    verdict = "模型优于朴素基线, 可参考" if abs(mae - best) < 1e-6 else "模型未优于朴素基线, 建议直接用基线"
+                    st.markdown(f"- 结论: **{verdict}**")
+                else:
+                    st.markdown("- 朴素基线: 样本不足, 无法对照")
+                st.markdown(f"- 预测区间覆盖率: **{cov:.0f}%**（实际值落进波动范围的比例; "
+                            f"若远低于名义水平, 说明区间仍偏窄）")
+                import plotly.graph_objects as go
+                fig = go.Figure()
+                fig.add_bar(x=back["月份"], y=back["实际"], name="实际", marker_color="#185FA5")
+                fig.add_scatter(x=back["月份"], y=back["预测"], mode="lines+markers",
+                                name="预测", line=dict(color="#D85A30"))
+                fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=60),
+                                  legend_orientation="h", yaxis_title="检修项数")
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(b2[["月份", "实际", "预测", "区间下", "区间上",
+                                 "基线_上月", "基线_同月", "偏差%"]].round(0),
                              use_container_width=True, hide_index=True)
                 st.caption(f"近 12 月点估计平均绝对偏差 {mae:.0f}%（仅供复盘参考）。")
 
@@ -1702,15 +2355,23 @@ def render_review():
                         return 0.0
 
                 sm2["正向(外送)"] = sm2["正向限额"].apply(_fwd)
-                sm2 = sm2[sm2["正向(外送)"] > 0]
-                if not sm2.empty:
+                # 卡脖子值 = 该断面当月『最低』正向限额(最紧张时段约束外送能力),
+                # 不把各时段限额加总(加总会虚高数倍, 如甘陕 950+560+950+700+950≈4110 实为5个时段)
+                per_sec = (sm2.groupby("断面名称")["正向(外送)"]
+                           .apply(lambda s: float(s[s > 0].min()) if (s > 0).any() else 0.0)
+                           .reset_index())
+                per_sec = per_sec[per_sec["正向(外送)"] > 0]
+                if not per_sec.empty:
                     import plotly.graph_objects as go
-                    fig = go.Figure(go.Bar(x=sm2["断面名称"], y=sm2["正向(外送)"],
-                                           marker_color="#185FA5"))
+                    fig = go.Figure(go.Bar(x=per_sec["断面名称"], y=per_sec["正向(外送)"],
+                                           marker_color="#185FA5",
+                                           text=per_sec["正向(外送)"].astype(int),
+                                           textposition="outside"))
                     fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=60),
-                                      yaxis_title="正向限额(外送)")
+                                      yaxis_title="本月最低正向限额(外送·卡脖子值)")
                     st.plotly_chart(fig, use_container_width=True)
-                    st.caption("各断面正向(外送)限额对比; 限额越低, 该通道外送空间越小; "
+                    st.caption("柱高=该断面当月『最低』正向限额(最紧张时段), 即外送能力的卡脖子约束, "
+                               "不把各时段限额加总; 限额越低, 该通道外送空间越小; "
                                "0 表示该通道仅可受入(反向)。")
             except Exception:
                 pass
@@ -1761,7 +2422,68 @@ def render_review():
         st.info("暂无联络线分时数据。")
 
     st.write("---")
-    st.caption("本页均基于已披露实测数据; '影响电价区间'等需现货价接入后在'当月检修明细'页补充。")
+    st.caption("本页各交易信号均基于已披露实测数据; '影响电价区间'等需现货价接入后在'当月检修明细'页补充。"
+               "🌤 天气适配块(页尾)为已披露检修×天气预报扩展, 天气非实测。")
+
+    # ---------- 11. 各模块数据覆盖期(口径透明) ----------
+    st.markdown("### 📚 各模块数据覆盖期")
+    st.caption("看板各数据源的覆盖区间; 预测月超出覆盖期时, 对应面板会提示『数据不足』而非编造。")
+
+    def _cov(loader, col="月份"):
+        try:
+            d = loader()
+            if d is None or d.empty:
+                return "—"
+            ms = d[col].astype(str)
+            return f"{ms.min()} ~ {ms.max()}（{len(d)} 行）"
+        except Exception:
+            return "—"
+
+    cov_rows = [
+        ("检修记录", _cov(load_maint, "披露月份")),
+        ("月度披露报告", _cov(load_disclosure)),
+        ("月度平衡", _cov(load_bal)),
+        ("断面限额", _cov(load_section)),
+        ("月度交易计划", _cov(load_trade_plan)),
+        ("联络线分时", _cov(load_tieline)),
+    ]
+    st.dataframe(pd.DataFrame(cov_rows, columns=["数据模块", "覆盖期"]),
+                 use_container_width=True, hide_index=True)
+
+    # ---------- 12. 🌤 天气-检修适配(已披露检修 × 未来天气) ----------
+    st.markdown("### 🌤 天气-检修适配（已披露检修 × 未来 10 天天气）")
+    st.caption("本块为『已披露检修计划 × 未来 10 天天气』的扩展分析: 天气为模式预报(非实测), "
+               "仅用于趋势与受限阈值判断; 其余各块均为已披露实测。天气适配按所选月检修计划 + 未来天气判断可作业窗口。")
+    render_weather_maint(ty, tm, df, df_sec)
+
+    # ===== 💰 已披露现货电价(月均, 2026-1~8) =====
+    st.markdown("---")
+    st.markdown("### 💰 已披露现货电价(月度均, 2026-01~08)")
+    st.caption("数据源: daily_spot_price(已接入). 单位 元/MWh. 现货价是检修-供给-价格传导链的最终兑现, 直接服务报价决策。")
+    try:
+        import plotly.graph_objects as go
+        _c = pymysql.connect(**DB_CONFIG)
+        _ms = pd.read_sql(
+            "SELECT DATE_FORMAT(`日期`,'%Y-%m') ym, "
+            "ROUND(AVG(`日前价_元MWh`),1) da, ROUND(AVG(`实时价_元MWh`),1) rt, "
+            "ROUND(AVG(`偏差_元MWh`),1) sp "
+            "FROM daily_spot_price GROUP BY ym ORDER BY ym", _c)
+        _c.close()
+        if not _ms.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=_ms['ym'], y=_ms['da'], name='日前月均'))
+            fig.add_trace(go.Bar(x=_ms['ym'], y=_ms['rt'], name='实时月均'))
+            fig.update_layout(barmode='group', title='月度现货均价(元/MWh)', yaxis_title='元/MWh',
+                              height=340, margin=dict(l=40, r=20, t=40, b=30))
+            st.plotly_chart(fig, use_container_width=True)
+            hi = _ms.loc[_ms['da'].idxmax()]
+            lo = _ms.loc[_ms['da'].idxmin()]
+            st.info(f"月度日前均价区间: {lo['da']}({lo['ym']}) ~ {hi['da']}({hi['ym']}) 元/MWh。"
+                    f"高价月(检修/外送双重收紧时)报价偏多; 低价月(新能源大发)关注低价消纳与负价风险。")
+        else:
+            st.caption("daily_spot_price 暂无数据")
+    except Exception as _e:
+        st.caption(f"现货电价加载异常: {_e}")
 
 
 def render_ledger():
@@ -1785,10 +2507,25 @@ def render_ledger():
             mask = (df["开始日期_dt"].dt.date >= d_range[0]) & (df["开始日期_dt"].dt.date <= d_range[1])
             df = df[mask]
 
-    show = df[df["年"].isin(year) & df["类别"].isin(cat) & df["检修级别"].isin(level)]
+    show = df[df["年"].isin(year) & df["类别"].isin(cat) & df["检修级别"].isin(level)].copy()
+
+    # 标记跨月续检（底仓）: 开始月份 ≠ 结束月份, 即上月延续到本月
+    if "开始日期_dt" in show.columns and "结束日期_dt" in show.columns:
+        show["跨月标记"] = ""
+        _m1 = show["开始日期_dt"].dt.month
+        _m2 = show["结束日期_dt"].dt.month
+        show.loc[_m1 != _m2, "跨月标记"] = "✅ 跨月续检"
+    else:
+        show["跨月标记"] = ""
+
+    only_carry = st.checkbox("只看跨月续检（底仓）", value=False)
+    if only_carry:
+        show = show[show["跨月标记"] == "✅ 跨月续检"]
+
     st.markdown(f"**共 {len(show):,} 条记录**")
-    st.dataframe(show.drop(columns=[c for c in show.columns if c in ("开始日期_dt", "结束日期_dt", "年", "月")],
-                            errors="ignore"),
+    _drop_cols = [c for c in show.columns if c in ("开始日期_dt", "结束日期_dt", "年", "月")]
+    _display_cols = ["跨月标记"] + [c for c in show.columns if c not in _drop_cols and c != "跨月标记"]
+    st.dataframe(show[_display_cols],
                  use_container_width=True, hide_index=True, height=420)
 
     csv = show.to_csv(index=False).encode("utf-8-sig")
@@ -1798,12 +2535,466 @@ def render_ledger():
     # 断面限额面板已移至「📈 已披露复盘」页(第 9 项), 与联络线分时并列, 仅用已披露实测。
 
 
+# ==================== 📅 日度态势(新, 框架) ====================
+def _build_daily_summary():
+    """合成日度态势页顶部核心结论卡片。返回 {'spot_date':str,'lines':[...]}。"""
+    try:
+        _c = pymysql.connect(**DB_CONFIG)
+        lines = []
+        sd = "—"
+        # 现货: 最新交易日快照
+        _r = pd.read_sql("SELECT MAX(`日期`) d FROM daily_spot_price", _c)
+        if not _r.empty and _r['d'].iloc[0] is not None:
+            sd = pd.to_datetime(_r['d'].iloc[0]).strftime("%Y-%m-%d")
+            _day = pd.read_sql(
+                "SELECT `时段`,`日前价_元MWh`,`实时价_元MWh` FROM daily_spot_price "
+                "WHERE `日期`=%s ORDER BY `时段`", _c, params=(sd,))
+            if not _day.empty:
+                da = _day['日前价_元MWh'].mean(); rt = _day['实时价_元MWh'].mean()
+                _day['sp'] = (_day['日前价_元MWh'] - _day['实时价_元MWh']).abs()
+                mx = _day.loc[_day['sp'].idxmax()]
+                if da - rt > da * 0.05:
+                    interp = "实时价持续低于日前价 → 实际供给比预期宽松(利于买方, 日前持仓者注意实时卖压)"
+                elif rt - da > da * 0.05:
+                    interp = "实时价高于日前价 → 实际供给偏紧(利于日前卖出, 实时采购成本上升)"
+                else:
+                    interp = "日前/实时价格接近 → 预期与实际基本吻合"
+                lines.append(
+                    f"💰 **现货(最新交易日 {sd})**: 日前均 {da:.1f} / 实时均 {rt:.1f} 元/MWh, "
+                    f"最大价差 **{mx['sp']:.1f}**(出现在 {int(mx['时段'])}时)。{interp}。")
+        # 天气: 未来10天
+        _w = pd.read_sql(
+            "SELECT `时间`,`点位名称`,`风速_10m`,`降水_mm`,`雷暴` FROM weather_hourly "
+            "WHERE `时间`>=NOW() AND `时间`<DATE_ADD(NOW(),INTERVAL 10 DAY)", _c)
+        if not _w.empty:
+            _w["触发"] = (_w["风速_10m"] > 10.7) | (_w["雷暴"] == 1) | (_w["降水_mm"] > 0.5)
+            _h = _w[_w["触发"]].copy()
+            if not _h.empty:
+                def _k(r):
+                    if r["雷暴"] == 1: return "🌪 雷暴"
+                    if r["风速_10m"] > 10.7: return "💨 大风"
+                    return "🌧 强降水"
+                _h["类型"] = _h.apply(_k, axis=1); _h["日"] = _h["时间"].dt.date
+                _g = _h.groupby(["点位名称", "类型", "日"]).agg(
+                    峰值风速=("风速_10m", "max"), 峰值降水=("降水_mm", "max"),
+                    雷暴=("雷暴", "max")).reset_index()
+                _bypt = _g.groupby("点位名称").size().sort_values(ascending=False)
+                _dom = _g.groupby("类型").size().idxmax()
+                _top = "、".join(_bypt.head(2).index.tolist())
+                _mxw = _g["峰值风速"].max()
+                lines.append(
+                    f"⚠ **天气(未来10天)**: 共 {len(_g)} 项风险(涉及 {_g['点位名称'].nunique()} 点位), "
+                    f"集中于 **{_top}** 等地, 主导「{_dom}」, 峰值风速 {_mxw:.1f} m/s, 或影响风电出力与户外检修。")
+            else:
+                lines.append("⚠ **天气(未来10天)**: 窗口良好, 无受限预警。")
+        # 新能源出力(若有)
+        _rn = pd.read_sql("SELECT MAX(`日期`) d FROM daily_renewable", _c)
+        if not _rn.empty and _rn['d'].iloc[0] is not None:
+            rdate = pd.to_datetime(_rn['d'].iloc[0]).strftime("%Y-%m-%d")
+            _rd = pd.read_sql("SELECT `风电出力_MW`,`光伏出力_MW` FROM daily_renewable WHERE `日期`=%s", _c, params=(rdate,))
+            if not _rd.empty:
+                wpk = _rd['风电出力_MW'].max(); spk = _rd['光伏出力_MW'].max()
+                lines.append(f"💨 **新能源出力(最新 {rdate})**: 风电峰值 {wpk:.0f} MW, 光伏峰值 {spk:.0f} MW, "
+                             f"关注午间光伏大发时段的新能源消纳压力。")
+        # 负荷(若有)
+        _ld = pd.read_sql("SELECT MAX(`日期`) d FROM daily_load", _c)
+        if not _ld.empty and _ld['d'].iloc[0] is not None:
+            ldate = pd.to_datetime(_ld['d'].iloc[0]).strftime("%Y-%m-%d")
+            _ldf = pd.read_sql("SELECT `统调负荷_MW` FROM daily_load WHERE `日期`=%s", _c, params=(ldate,))
+            if not _ldf.empty:
+                pk = _ldf['统调负荷_MW'].max(); tr = _ldf['统调负荷_MW'].min()
+                lines.append(f"⚡ **负荷(最新 {ldate})**: 峰值 {pk:.0f} MW, 谷值 {tr:.0f} MW, "
+                             f"峰谷差 {pk - tr:.0f} MW。")
+        # 联络线
+        _td = pd.read_sql("SELECT MAX(`日期`) d FROM daily_tie_line", _c)
+        if not _td.empty and _td['d'].iloc[0] is not None:
+            lines.append("🔌 **联络线**: 日度实时数据已接入, 详见下方「联络线外送」模块(按通道净送出)。")
+        else:
+            lines.append("🔌 **联络线**: 仅月度披露典型曲线(非实时日度); 出力/负荷/联络线日度待接入, 暂无法合成完整供给结论。")
+        _c.close()
+        return {"spot_date": sd, "lines": lines}
+    except Exception as _e:
+        return {"spot_date": "—", "lines": [f"⚠ 核心结论合成失败: {_e}"]}
+
+
+def render_daily():
+    """日度态势页: 5 个子模块. 现货价/天气已接入, 出力/负荷/联络线日度待接入."""
+    import pandas as _pd
+    st.markdown("# 📅 日度态势（5 数据源 · 接入中）")
+    st.caption("本页聚合 5 块日度级信号, 服务每日盘前/盘中/盘后决策。"
+               "现货价(1-8月历史)与天气(未来10天预报)已接入; 出力/负荷/联络线日度的表结构与导入脚本已就绪, 拿到数据即接。"
+               "⚠️ 现货为历史披露、天气为预报, 均非实时行情, 决策以当日实盘为准。")
+
+    # ---------- 顶栏: 核心结论(数据快照合成) ----------
+    _summ = _build_daily_summary()
+    if _summ:
+        with st.container(border=True):
+            st.markdown(f"### 📌 核心结论（现货取最新交易日 {_summ['spot_date']} 快照 · 天气取未来10天预报）")
+            for _line in _summ['lines']:
+                st.markdown(_line)
+
+    # ---------- 总览: 5 块接入状态(动态) ----------
+    st.markdown("### 📊 数据接入总览")
+    _c0 = pymysql.connect(**DB_CONFIG)
+    def _cnt(t):
+        try:
+            return int(pd.read_sql(f"SELECT COUNT(*) n FROM `{t}`", _c0).iloc[0]['n'])
+        except Exception:
+            return 0
+    ren_n, load_n, tie_n, spot_n = _cnt('daily_renewable'), _cnt('daily_load'), _cnt('daily_tie_line'), _cnt('daily_spot_price')
+    _c0.close()
+    status = _pd.DataFrame([
+        ("💨 风电/光伏出力",   "daily_renewable",            "小时级 MW",          f"{'✅ 已接入' if ren_n else '⏳ 待接入(需爬取)'}"),
+        ("⚡ 负荷曲线",       "daily_load",                 "小时级 MW",          f"{'✅ 已接入' if load_n else '⏳ 待接入(需爬取)'}"),
+        ("💰 现货价分时",     "daily_spot_price",           "日前/实时 元/MWh",   f"✅ 已接入({spot_n}行, 1-8月历史)"),
+        ("🔌 联络线外送",     "daily_tie_line/联络线分时",  "日度MW/月度典型",    f"{'✅ 日度已接入' if tie_n else '🟡 月度披露(非实时)'}"),
+        ("⚠ 天气预警",       "weather_hourly",             "雷暴/大风/降水",     "✅ 数据已就位"),
+    ], columns=["模块", "数据源(表)", "粒度/字段", "状态"])
+    st.dataframe(status, use_container_width=True, hide_index=True)
+
+    st.write("---")
+
+    # ---------- 1. 风电/光伏出力 ----------
+    with st.container(border=True):
+        st.markdown("#### 💨 风电/光伏出力")
+        st.caption("数据源: daily_renewable(待接入)。字段: 日期/时段(0-23)/风电出力_MW/光伏出力_MW/新能源总出力_MW。")
+        with st.expander("📐 数据 schema (MySQL)", expanded=False):
+            st.code(
+                "CREATE TABLE daily_renewable (\n"
+                "  日期 DATE, 时段 TINYINT,\n"
+                "  风电出力_MW DECIMAL(12,2), 光伏出力_MW DECIMAL(12,2),\n"
+                "  新能源总出力_MW DECIMAL(12,2),\n"
+                "  PRIMARY KEY (日期, 时段)\n"
+                ");", language="sql")
+        try:
+            import plotly.graph_objects as go
+            _c = pymysql.connect(**DB_CONFIG)
+            _sd = pd.read_sql("SELECT MAX(`日期`) d FROM daily_renewable", _c)
+            if not _sd.empty and _sd['d'].iloc[0] is not None:
+                _alld = pd.read_sql("SELECT DISTINCT `日期` d FROM daily_renewable ORDER BY d", _c)['d'].tolist()
+                sd = st.selectbox("选择日期", [pd.to_datetime(x).strftime("%Y-%m-%d") for x in _alld],
+                                  index=len(_alld) - 1, key="ren_d")
+                _df = pd.read_sql(
+                    "SELECT `时段`,`风电出力_MW`,`光伏出力_MW`,`新能源总出力_MW` FROM daily_renewable "
+                    "WHERE `日期`=%s ORDER BY `时段`", _c, params=(sd,))
+                if not _df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=_df['时段'], y=_df['风电出力_MW'], fill='tozeroy', mode='lines',
+                                            name='风电出力', line=dict(color='#2980B9')))
+                    fig.add_trace(go.Scatter(x=_df['时段'], y=_df['光伏出力_MW'], fill='tozeroy', mode='lines',
+                                            name='光伏出力', line=dict(color='#F39C12')))
+                    if _df['新能源总出力_MW'].notna().any():
+                        fig.add_trace(go.Scatter(x=_df['时段'], y=_df['新能源总出力_MW'], mode='lines',
+                                                name='新能源总出力', line=dict(color='#27AE60', width=2)))
+                    fig.update_layout(title=f"{sd} 风电/光伏出力(24h, MW)", xaxis_title='时段(0-23)',
+                                      yaxis_title='MW', height=340, margin=dict(l=40, r=20, t=40, b=30))
+                    st.plotly_chart(fig, use_container_width=True)
+                    wpk = _df['风电出力_MW'].max(); spk = _df['光伏出力_MW'].max()
+                    c1, c2 = st.columns(2)
+                    c1.metric("风电峰值", f"{wpk:.0f} MW")
+                    c2.metric("光伏峰值", f"{spk:.0f} MW")
+                    st.info("📈 光伏呈日间单峰(白昼), 风电波动较大; 与负荷曲线叠加可判断新能源消纳/弃风弃光压力。")
+                    if len(_df) < 24:
+                        st.warning(f"⚠ {sd} 仅 {len(_df)} 个时段有数据, 曲线不完整。")
+                else:
+                    st.info(f"{sd} 无逐时数据")
+            else:
+                st.info("⏳ 数据待接入 — 运行 `python import_renewable.py --file 风电光伏出力.xlsx` 导入后, "
+                         "此处自动显示 24h 出力曲线。")
+            _c.close()
+        except Exception as _e:
+            st.error(f"风电/光伏加载失败: {_e}")
+
+    st.divider()
+
+    # ---------- 2. 负荷曲线 ----------
+    with st.container(border=True):
+        st.markdown("#### ⚡ 负荷曲线")
+        st.caption("数据源: daily_load(待接入)。字段: 日期/时段(0-23)/统调负荷_MW/全社会负荷_MW。"
+                   "可选叠加 weather_hourly 气温(兰州, 若该日已爬取)。")
+        with st.expander("📐 数据 schema (MySQL)", expanded=False):
+            st.code(
+                "CREATE TABLE daily_load (\n"
+                "  日期 DATE, 时段 TINYINT,\n"
+                "  统调负荷_MW DECIMAL(12,2), 全社会负荷_MW DECIMAL(12,2),\n"
+                "  PRIMARY KEY (日期, 时段)\n"
+                ");", language="sql")
+        try:
+            import plotly.graph_objects as go
+            _c = pymysql.connect(**DB_CONFIG)
+            _sd = pd.read_sql("SELECT MAX(`日期`) d FROM daily_load", _c)
+            if not _sd.empty and _sd['d'].iloc[0] is not None:
+                _alld = pd.read_sql("SELECT DISTINCT `日期` d FROM daily_load ORDER BY d", _c)['d'].tolist()
+                sd = st.selectbox("选择日期", [pd.to_datetime(x).strftime("%Y-%m-%d") for x in _alld],
+                                  index=len(_alld) - 1, key="load_d")
+                _df = pd.read_sql(
+                    "SELECT `时段`,`统调负荷_MW`,`全社会负荷_MW` FROM daily_load WHERE `日期`=%s ORDER BY `时段`",
+                    _c, params=(sd,))
+                if not _df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=_df['时段'], y=_df['统调负荷_MW'], mode='lines', name='统调负荷',
+                                            line=dict(color='#8E44AD', width=2)))
+                    if _df['全社会负荷_MW'].notna().any():
+                        fig.add_trace(go.Scatter(x=_df['时段'], y=_df['全社会负荷_MW'], mode='lines', name='全社会负荷',
+                                                line=dict(color='#16A085', dash='dot')))
+                    # 气温叠加(若有兰州该日数据)
+                    _wt = pd.read_sql(
+                        "SELECT HOUR(`时间`) h, `气温_2m` t FROM weather_hourly "
+                        "WHERE DATE(`时间`)=%s AND `点位名称`='兰州' ORDER BY `时间`", _c, params=(sd,))
+                    if not _wt.empty and _wt['t'].notna().any():
+                        fig.add_trace(go.Scatter(x=_wt['h'], y=_wt['t'], mode='lines', name='兰州气温',
+                                                yaxis='y2', line=dict(color='#E67E22', dash='dash')))
+                        fig.update_layout(yaxis2=dict(title='气温℃', overlaying='y', side='right', showgrid=False))
+                    fig.update_layout(title=f"{sd} 负荷曲线(24h, MW)", xaxis_title='时段(0-23)', yaxis_title='MW',
+                                      height=340, margin=dict(l=40, r=40, t=40, b=30))
+                    st.plotly_chart(fig, use_container_width=True)
+                    pk = _df['统调负荷_MW'].max(); tr = _df['统调负荷_MW'].min()
+                    c1, c2 = st.columns(2)
+                    c1.metric("负荷峰值", f"{pk:.0f} MW")
+                    c2.metric("负荷谷值", f"{tr:.0f} MW")
+                    st.info("📈 负荷高峰多在早晚; 与气温叠加可量化温度弹性(夏季空调/冬季采暖)。")
+                    if len(_df) < 24:
+                        st.warning(f"⚠ {sd} 仅 {len(_df)} 个时段有数据。")
+                else:
+                    st.info(f"{sd} 无逐时数据")
+            else:
+                st.info("⏳ 数据待接入 — 运行 `python import_load.py --file 负荷曲线.xlsx` 导入后, "
+                         "此处自动显示 24h 负荷曲线(可叠加气温)。")
+            _c.close()
+        except Exception as _e:
+            st.error(f"负荷加载失败: {_e}")
+
+    st.divider()
+
+    # ---------- 3. 现货价分时(日前 vs 实时) ----------
+    with st.container(border=True):
+        st.markdown("#### 💰 现货价分时(日前 vs 实时)")
+        st.caption("数据源: daily_spot_price(已接入 2026-01~08, 5832 行, 全月全24时段, 元/MWh)。"
+                   "出清均价仅 1-4 月有(5-8 月空); 峰平谷已按小时统一补齐。日前-实时价差 → 套利/风险时段。")
+        with st.expander("📐 实际数据 schema (MySQL)", expanded=False):
+            st.code(
+                "CREATE TABLE daily_spot_price (\n"
+                "  日期 DATE, 时段 TINYINT, 时段标签 VARCHAR(20), 分段 VARCHAR(4),\n"
+                "  日前价_元MWh DECIMAL(10,4), 实时价_元MWh DECIMAL(10,4),\n"
+                "  出清均价_元MWh DECIMAL(10,4), 偏差_元MWh DECIMAL(10,4) AS (日前-实时) STORED,\n"
+                "  PRIMARY KEY (日期, 时段)\n"
+                ");", language="sql")
+        try:
+            import plotly.graph_objects as go
+            from datetime import date as _date
+            _c = pymysql.connect(**DB_CONFIG)
+            _months = pd.read_sql(
+                "SELECT DISTINCT DATE_FORMAT(`日期`,'%Y-%m') ym FROM daily_spot_price ORDER BY ym", _c)['ym'].tolist()
+            if _months:
+                ym = st.selectbox("选择月份", _months, index=len(_months) - 1, key="spot_ym")
+                y, mo = int(ym[:4]), int(ym[5:7])
+                _days = pd.read_sql(
+                    "SELECT DISTINCT DAY(`日期`) d FROM daily_spot_price "
+                    "WHERE DATE_FORMAT(`日期`,'%%Y-%%m')=%s ORDER BY d", _c, params=(ym,))['d'].tolist()
+                d = st.selectbox("选择日期", _days, index=len(_days) - 1, key="spot_d")
+                _day = pd.read_sql(
+                    "SELECT `时段`,`分段`,`日前价_元MWh`,`实时价_元MWh`,`出清均价_元MWh` "
+                    "FROM daily_spot_price WHERE `日期`=%s ORDER BY `时段`", _c, params=(f"{y}-{mo:02d}-{d:02d}",))
+                if not _day.empty:
+                    _day = _day.copy()
+                    _day['sp'] = (_day['日前价_元MWh'] - _day['实时价_元MWh']).abs()
+                    mx = _day.loc[_day['sp'].idxmax()]
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=_day['时段'], y=_day['日前价_元MWh'], mode='lines+markers', name='日前价'))
+                    fig.add_trace(go.Scatter(x=_day['时段'], y=_day['实时价_元MWh'], mode='lines+markers', name='实时价'))
+                    if _day['出清均价_元MWh'].notna().any():
+                        fig.add_trace(go.Scatter(x=_day['时段'], y=_day['出清均价_元MWh'], mode='lines+markers', name='出清均价'))
+                    # 标注最大价差时点(用户建议1)
+                    fig.add_annotation(x=int(mx['时段']), y=float(mx['日前价_元MWh']),
+                                       text=f"最大价差 {mx['sp']:.1f} 元/MWh<br>({int(mx['时段'])}时)",
+                                       showarrow=True, arrowhead=2, ax=0, ay=-40,
+                                       font=dict(color="#C0392B", size=12), arrowcolor="#C0392B")
+                    # 套利/风险窗口阴影(价差大的时段)
+                    _thr = max(40.0, float(_day['sp'].quantile(0.75)))
+                    for _, r in _day.iterrows():
+                        if r['sp'] >= _thr:
+                            h = int(r['时段'])
+                            fig.add_vrect(x0=h - 0.5, x1=h + 0.5, fillcolor="rgba(241,196,15,0.18)",
+                                          line_width=0, layer="below")
+                    fig.update_layout(title=f"{ym}-{d:02d} 分时现货价(元/MWh) — 黄区=价差大时段", xaxis_title='时段(0-23)',
+                                      yaxis_title='元/MWh', height=360, margin=dict(l=40, r=20, t=40, b=30))
+                    st.plotly_chart(fig, use_container_width=True)
+                    da_avg = _day['日前价_元MWh'].mean()
+                    rt_avg = _day['实时价_元MWh'].mean()
+                    spread = _day['sp'].max()
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("日前均价", f"{da_avg:.1f}")
+                    c2.metric("实时均价", f"{rt_avg:.1f}")
+                    c3.metric("最大价差(日前-实时)", f"{spread:.1f}")
+                    # 数据驱动的解释(用户建议1)
+                    if da_avg - rt_avg > da_avg * 0.05:
+                        interp = "实时价持续低于日前价 → 实际供给比预期宽松(利于买方, 日前持仓者注意实时卖压)"
+                    elif rt_avg - da_avg > da_avg * 0.05:
+                        interp = "实时价高于日前价 → 实际供给偏紧(利于日前卖出, 实时采购成本上升)"
+                    else:
+                        interp = "日前/实时价格接近 → 预期与实际基本吻合"
+                    st.info(f"📈 {interp}。黄色阴影为价差较大的「套利/风险窗口」时段, 可重点关注日前-实时反向操作机会。")
+                    if len(_day) < 24:
+                        st.warning(f"⚠ {ym}-{d:02d} 仅 {len(_day)} 个时段有数据, 曲线不完整。")
+                # 当月逐日均价面板
+                st.markdown("**📅 当月逐日均价(日前 vs 实时)**")
+                _m = pd.read_sql(
+                    "SELECT DAY(`日期`) d, AVG(`日前价_元MWh`) da, AVG(`实时价_元MWh`) rt "
+                    "FROM daily_spot_price WHERE DATE_FORMAT(`日期`,'%%Y-%%m')=%s GROUP BY d ORDER BY d", _c, params=(ym,))
+                fig2 = go.Figure()
+                fig2.add_trace(go.Bar(x=_m['d'], y=_m['da'], name='日前日均'))
+                fig2.add_trace(go.Bar(x=_m['d'], y=_m['rt'], name='实时日均'))
+                fig2.update_layout(barmode='group', title=f"{ym} 逐日均价(元/MWh)", xaxis_title='日',
+                                   yaxis_title='元/MWh', height=320, margin=dict(l=40, r=20, t=40, b=30))
+                st.plotly_chart(fig2, use_container_width=True)
+                if not _m.empty:
+                    hi = _m.loc[_m['da'].idxmax()]
+                    lo = _m.loc[_m['da'].idxmin()]
+                    st.info(f"本月日前日均最高: {int(hi['d'])}日 ({hi['da']:.1f}) | 最低: {int(lo['d'])}日 ({lo['da']:.1f})"
+                            f" — 高低价日对应检修/外送安排, 关注价差套利窗口。")
+                st.caption("↑ 已接入 daily_spot_price(5832 行, 全月24时段); 单位 元/MWh; 5-8月无出清均价(图表自动省略); 峰平谷已按小时补齐。")
+            else:
+                st.warning("daily_spot_price 暂无数据, 请先运行 import_spot_price.py")
+            _c.close()
+        except Exception as _e:
+            st.error(f"现货价加载失败: {_e}")
+
+    st.divider()
+
+    # ---------- 4. 联络线外送 ----------
+    with st.container(border=True):
+        st.markdown("#### 🔌 联络线外送")
+        try:
+            import plotly.graph_objects as go
+            _c = pymysql.connect(**DB_CONFIG)
+            _dt = pd.read_sql("SELECT MAX(`日期`) d FROM daily_tie_line", _c)
+            if not _dt.empty and _dt['d'].iloc[0] is not None:
+                # === 真实日度外送 ===
+                st.caption("数据源: daily_tie_line(已接入日度)。按通道展示 24h 外送/受入/净送出。")
+                _alld = pd.read_sql("SELECT DISTINCT `日期` d FROM daily_tie_line ORDER BY d", _c)['d'].tolist()
+                sd = st.selectbox("选择日期", [pd.to_datetime(x).strftime("%Y-%m-%d") for x in _alld],
+                                  index=len(_alld) - 1, key="tie_d")
+                _df = pd.read_sql(
+                    "SELECT `时段`,`通道名`,`外送_MW`,`受入_MW`,`净送出_MW` FROM daily_tie_line "
+                    "WHERE `日期`=%s ORDER BY `通道名`,`时段`", _c, params=(sd,))
+                if not _df.empty:
+                    lines = _df['通道名'].unique().tolist()
+                    sel = st.multiselect("通道", lines, default=lines, key="tie_lines")
+                    _sub = _df[_df['通道名'].isin(sel)]
+                    fig = go.Figure()
+                    for ln in sel:
+                        _l = _sub[_sub['通道名'] == ln]
+                        fig.add_trace(go.Scatter(x=_l['时段'], y=_l['净送出_MW'], mode='lines', name=f"{ln}(净送出)"))
+                    fig.update_layout(title=f"{sd} 各通道净送出(24h, MW, +外送/-受入)", xaxis_title='时段(0-23)',
+                                      yaxis_title='MW', height=360, margin=dict(l=40, r=20, t=40, b=30))
+                    st.plotly_chart(fig, use_container_width=True)
+                    tot = _sub.groupby('通道名').agg(外送_总MW=('外送_MW', 'sum'), 受入_总MW=('受入_MW', 'sum')).reset_index()
+                    st.dataframe(tot, use_container_width=True, hide_index=True)
+                    st.info("📈 净送出为正=甘肃净外送(利好本地消纳/价格承压); 为负=净受入。各通道分时曲线可判断外送通道瓶颈时段。")
+            else:
+                # === 月度典型曲线(现有) ===
+                st.caption("数据源: 联络线分时(997行, 2024-01~2026-09 月度披露)。"
+                           "⚠️ 该表为月度典型日内曲线——每月各日 24h 数值相同, 属披露月均形状, 非逐日实时流向。"
+                           "日度实时外送需接入调度/西北分部公开数据(运行 import_tie_line.py)。")
+                _mos = pd.read_sql("SELECT DISTINCT `月份` m FROM `联络线分时` ORDER BY m", _c)['m'].tolist()
+                if _mos:
+                    mo = st.selectbox("选择月份(披露)", _mos, index=len(_mos) - 1, key="tl_mo")
+                    _tl = pd.read_sql("SELECT * FROM `联络线分时` WHERE `月份`=%s", _c, params=(mo,))
+                    _hour_cols = [f"{h}时" for h in range(24)]
+                    for cc in _hour_cols:
+                        _tl[cc] = pd.to_numeric(_tl[cc], errors="coerce")
+                    _prof = _tl[_hour_cols].mean()  # 各日数值相同, mean 即该月典型曲线
+                    fig = go.Figure()
+                    fig.add_scatter(x=list(range(24)), y=_prof.values, mode="lines+markers",
+                                    line=dict(color="#185FA5", width=2),
+                                    hovertemplate="%{x}时<br>%{y:.0f}<extra></extra>")
+                    fig.update_layout(height=320, margin=dict(l=40, r=20, t=30, b=30),
+                                      xaxis_title="小时", yaxis_title="交换功率(万kW)", xaxis=dict(dtick=3),
+                                      title=f"{mo} 典型日内外送曲线(月度披露)")
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.info("📌 曲线显示该月外送日内高峰/低谷时段(便于择时); 但为披露月均形状, 不代表具体某日实时流向。"
+                            "真正的「每日实时外送」需接入调度口径数据(运行 import_tie_line.py)。")
+                else:
+                    st.warning("联络线分时暂无数据")
+            _c.close()
+        except Exception as _e:
+            st.error(f"联络线加载失败: {_e}")
+
+    st.divider()
+
+    # ---------- 5. 天气预警卡(数据已就位, 提炼展示) ----------
+    with st.container(border=True):
+        st.markdown("#### ⚠ 天气预警卡（未来10天 · 提炼）")
+        st.caption("数据源: weather_hourly(已就位, 12 点位)。阈值: 风>10.7m/s 或 雷暴=1 或 降水>0.5mm。")
+        with st.expander("📐 触发规则", expanded=False):
+            st.code(
+                "# 受限判定(与「天气·检修适配」一致)\n"
+                "风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5\n"
+                "→ 红色预警(作业取消/改期)\n"
+                "风速_10m > 8.0 AND 雷暴 = 0 AND 降水 > 0.1\n"
+                "→ 黄色预警(加强监护)", language="text")
+        try:
+            _conn = pymysql.connect(**DB_CONFIG)
+            _df_w = pd.read_sql(
+                "SELECT `时间`,`点位名称`,`风速_10m`,`降水_mm`,`雷暴` FROM weather_hourly "
+                "WHERE `时间` >= NOW() AND `时间` < DATE_ADD(NOW(), INTERVAL 10 DAY) "
+                "ORDER BY `时间`", _conn)
+            _conn.close()
+            if not _df_w.empty:
+                _df_w["触发"] = (
+                    (_df_w["风速_10m"] > 10.7) |
+                    (_df_w["雷暴"] == 1) |
+                    (_df_w["降水_mm"] > 0.5)
+                )
+                _hits = _df_w[_df_w["触发"]].copy()
+                if not _hits.empty:
+                    def _kind(r):
+                        if r["雷暴"] == 1:    return "🌪 雷暴"
+                        if r["风速_10m"] > 10.7: return "💨 大风"
+                        return "🌧 强降水"
+                    _hits["类型"] = _hits.apply(_kind, axis=1)
+                    _hits["日"] = _hits["时间"].dt.date
+                    # 去重: 同点位+同类型+同日 合并为一项, 取峰值
+                    _g = _hits.groupby(["点位名称", "类型", "日"]).agg(
+                        峰值风速=("风速_10m", "max"), 峰值降水=("降水_mm", "max"),
+                        雷暴=("雷暴", "max")).reset_index()
+                    _g["严重度"] = _g["峰值风速"] + _g["雷暴"] * 1000
+                    _g = _g.sort_values("严重度", ascending=False)
+                    # 顶部总结句(用户建议3)
+                    _bypt = _g.groupby("点位名称").size().sort_values(ascending=False)
+                    _dom = _g.groupby("类型").size().idxmax()
+                    _top = "、".join(_bypt.head(2).index.tolist())
+                    _mxw = _g["峰值风速"].max()
+                    st.warning(f"⚠ 未来10天共 **{len(_g)} 项**天气风险(涉及 {_g['点位名称'].nunique()} 个点位), "
+                               f"集中于 **{_top}** 等地, 主导类型「{_dom}」, 峰值风速 {_mxw:.1f} m/s。"
+                               f"可能影响风电出力与户外检修作业窗口。")
+                    _show = _g.head(10).copy()
+                    _show = _show[["日", "点位名称", "类型", "峰值风速", "峰值降水"]]
+                    _show.columns = ["日期", "点位", "类型", "峰值风速m/s", "峰值降水mm"]
+                    st.dataframe(_show, use_container_width=True, hide_index=True, height=300)
+                    st.caption(f"↑ 仅列影响最大的前 10 项(已按点位+类型+日去重, 按严重度排序); 完整预警请按需扩展。")
+                else:
+                    st.success("✅ 未来 10 天天气窗口良好, 无受限预警")
+            else:
+                st.caption("weather_hourly 未来时段暂无数据")
+        except Exception as _e:
+            st.caption(f"天气数据加载异常: {_e}")
+
+    st.write("---")
+    st.caption(
+        "📝 **数据接入流程**: ①确认数据源 → ②按各 section schema 建 MySQL 表(已建) → ③运行 import_*.py 导入 → ④Dashboard 自动重载。"
+        " | 现货价与天气已接入; 出力/负荷/联络线日度表已就绪(import_renewable/load/tie_line.py), 数据到位即接通。"
+    )
+
+
 # ==================== 入口 ====================
-TAB = st.sidebar.radio("导航", ["📊 预测报告", "📈 已披露复盘", "📋 数据台账"], label_visibility="visible")
+TAB = st.sidebar.radio("导航", ["📊 预测报告", "📈 已披露复盘", "📋 数据台账", "📅 日度态势(新)"], label_visibility="visible")
 if TAB == "📊 预测报告":
     render_report()
 elif TAB == "📈 已披露复盘":
     render_review()
+elif TAB == "📅 日度态势(新)":
+    render_daily()
 else:
     render_ledger()
 
