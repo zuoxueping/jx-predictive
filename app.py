@@ -12,9 +12,9 @@ from datetime import datetime
 
 # ==================== 配置 ====================
 # 发布版(GitHub/Streamlit Cloud)无本地 MySQL, 改用同目录 SQLite 数据库.
-import sqlite3 as _sqlite3
+import sqlite3
 from datetime import datetime as _dt, date as _date
-import sys
+import re
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "power_data.db")
 
@@ -44,13 +44,10 @@ class _SQLiteCursor:
         params = list(params) if params else []
         # 1) 表名映射
         for cn, en in _TABLE_MAP.items():
-            import re
             sql = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(cn) + r"(?![A-Za-z0-9_])", en, sql)
         # 2) 去掉 MySQL 反引号(SQLite 中文列名可直接用)
         sql = sql.replace("`", "")
         # 3) MySQL 日期函数 -> SQLite
-        import re
-        # DATE_ADD(NOW(), INTERVAL %s DAY) 或 DATE_ADD(NOW(), INTERVAL 10 DAY)
         def _date_add_repl(m):
             nonlocal params
             placeholder = m.group(1)
@@ -60,15 +57,11 @@ class _SQLiteCursor:
                 val = placeholder.strip()
             return f"datetime('now', '+{val} day')"
         sql = re.sub(r"DATE_ADD\(\s*NOW\(\)\s*,\s*INTERVAL\s+(%s|\d+)\s+DAY\s*\)", _date_add_repl, sql)
-        # NOW()
         sql = sql.replace("NOW()", "datetime('now')")
-        # CURDATE()
         sql = sql.replace("CURDATE()", "date('now')")
-        # YEAR/MONTH/DAY
         sql = re.sub(r"YEAR\(([^)]+)\)", r"CAST(strftime('%Y', \1) AS INTEGER)", sql)
         sql = re.sub(r"MONTH\(([^)]+)\)", r"CAST(strftime('%m', \1) AS INTEGER)", sql)
         sql = re.sub(r"DAY\(([^)]+)\)", r"CAST(strftime('%d', \1) AS INTEGER)", sql)
-        # DATE_FORMAT(日期, '%Y-%m')
         sql = re.sub(r"DATE_FORMAT\(([^,]+),\s*'([^']+)'\s*\)", r"strftime('\2', \1)", sql)
         # 4) 参数占位符 %s -> ?
         sql = sql.replace("%s", "?")
@@ -90,32 +83,20 @@ class _SQLiteCursor:
         return getattr(self._cur, name)
 
 
-class _SQLiteConnection:
-    def __init__(self, path):
-        self._conn = _sqlite3.connect(path)
-        self._register_funcs()
-
-    def _register_funcs(self):
-        self._conn.create_function("NOW", 0, lambda: _dt.now().strftime("%Y-%m-%d %H:%M:%S"))
-        self._conn.create_function("CURDATE", 0, lambda: _date.today().strftime("%Y-%m-%d"))
+class _SQLiteConnection(sqlite3.Connection):
+    """SQLite 连接子类: pandas.read_sql 能识别为 sqlite3 连接, 且 cursor() 做 SQL 翻译."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.create_function("NOW", 0, lambda: _dt.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.create_function("CURDATE", 0, lambda: _date.today().strftime("%Y-%m-%d"))
 
     def cursor(self):
-        return _SQLiteCursor(self._conn.cursor())
-
-    def close(self):
-        return self._conn.close()
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
+        return _SQLiteCursor(super().cursor())
 
 
-class _FakePyMySQL:
-    @staticmethod
-    def connect(**kwargs):
-        return _SQLiteConnection(DB_PATH)
+def get_conn():
+    return sqlite3.connect(DB_PATH, factory=_SQLiteConnection)
 
-
-sys.modules["pymysql"] = _FakePyMySQL()
 
 # 第一步: 设备类型 → 容量影响权重(粗略版).
 # 依据"是否直接损失发电/供电能力"分档; 后续补到设备精确MW后可替换为真实容量.
@@ -191,16 +172,13 @@ st.set_page_config(
 )
 
 # ==================== 数据加载 ====================
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "power_data.db")
 @st.cache_data(ttl=600)
 def run_query(sql):
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(sql)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -275,7 +253,7 @@ def _wx_window(days=10):
     返回 (可作业小时比例 0-100, 详情字符串) 或 None(数据不足).
     """
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "SELECT COUNT(*) AS total, "
@@ -792,7 +770,7 @@ def trading_signal(df_bal, df_sec, df_maint, df_trade, target_year, target_month
 def weather_daily_grid(days=10):
     """未来 N 天逐日可作业率(12 点位平均). 返回 [(mm-dd, 可作业率%, 受限小时, 总小时), ...]."""
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "SELECT DATE(时间) AS d, COUNT(*) AS total, "
@@ -818,7 +796,7 @@ def weather_daily_grid(days=10):
 def point_weather_matrix(days=10):
     """12 点位 × 未来 N 天 可作业率矩阵. 返回 DataFrame[点位, 日期, 可作业率%, 受限原因]."""
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "SELECT 点位名称, DATE(时间) AS d, "
@@ -879,7 +857,7 @@ def maint_weather_decision(df_maint, target_year, target_month, top_n=8):
     sub = sub.sort_values("_imp", ascending=False).head(top_n * 3)
 
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = get_conn()
         cur = conn.cursor()
         out = []
         for _, r in sub.iterrows():
@@ -939,7 +917,7 @@ def weather_maint_risk(df_maint, target_year, target_month):
     if sub.empty:
         return []
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = get_conn()
         cur = conn.cursor()
         out = []
         for _, r in sub.iterrows():
@@ -1054,7 +1032,7 @@ def render_weather_maint(target_year, target_month, df_maint, df_sec):
     # ===== ④ 外送双重风险(雷暴 + 断面检修) =====
     if df_sec is not None and not df_sec.empty and "月份" in df_sec.columns:
         try:
-            conn = pymysql.connect(**DB_CONFIG)
+            conn = get_conn()
             cur = conn.cursor()
             cur.execute("SELECT COALESCE(SUM(雷暴),0) FROM weather_hourly "
                         "WHERE 时间 > NOW() AND 时间 < DATE_ADD(NOW(), INTERVAL 11 DAY)")
@@ -2563,7 +2541,7 @@ def render_review():
     st.caption("数据源: daily_spot_price(已接入). 单位 元/MWh. 现货价是检修-供给-价格传导链的最终兑现, 直接服务报价决策。")
     try:
         import plotly.graph_objects as go
-        _c = pymysql.connect(**DB_CONFIG)
+        _c = get_conn()
         _ms = pd.read_sql(
             "SELECT DATE_FORMAT(`日期`,'%Y-%m') ym, "
             "ROUND(AVG(`日前价_元MWh`),1) da, ROUND(AVG(`实时价_元MWh`),1) rt, "
@@ -2640,7 +2618,7 @@ def render_ledger():
 def _build_daily_summary():
     """合成日度态势页顶部核心结论卡片。返回 {'spot_date':str,'lines':[...]}。"""
     try:
-        _c = pymysql.connect(**DB_CONFIG)
+        _c = get_conn()
         lines = []
         sd = "—"
         # 现货: 最新交易日快照
@@ -2736,7 +2714,7 @@ def render_daily():
 
     # ---------- 总览: 5 块接入状态(动态) ----------
     st.markdown("### 📊 数据接入总览")
-    _c0 = pymysql.connect(**DB_CONFIG)
+    _c0 = get_conn()
     def _cnt(t):
         try:
             return int(pd.read_sql(f"SELECT COUNT(*) n FROM `{t}`", _c0).iloc[0]['n'])
@@ -2769,7 +2747,7 @@ def render_daily():
                 ");", language="sql")
         try:
             import plotly.graph_objects as go
-            _c = pymysql.connect(**DB_CONFIG)
+            _c = get_conn()
             _sd = pd.read_sql("SELECT MAX(`日期`) d FROM daily_renewable", _c)
             if not _sd.empty and _sd['d'].iloc[0] is not None:
                 _alld = pd.read_sql("SELECT DISTINCT `日期` d FROM daily_renewable ORDER BY d", _c)['d'].tolist()
@@ -2822,7 +2800,7 @@ def render_daily():
                 ");", language="sql")
         try:
             import plotly.graph_objects as go
-            _c = pymysql.connect(**DB_CONFIG)
+            _c = get_conn()
             _sd = pd.read_sql("SELECT MAX(`日期`) d FROM daily_load", _c)
             if not _sd.empty and _sd['d'].iloc[0] is not None:
                 _alld = pd.read_sql("SELECT DISTINCT `日期` d FROM daily_load ORDER BY d", _c)['d'].tolist()
@@ -2883,7 +2861,7 @@ def render_daily():
         try:
             import plotly.graph_objects as go
             from datetime import date as _date
-            _c = pymysql.connect(**DB_CONFIG)
+            _c = get_conn()
             _months = pd.read_sql(
                 "SELECT DISTINCT DATE_FORMAT(`日期`,'%Y-%m') ym FROM daily_spot_price ORDER BY ym", _c)['ym'].tolist()
             if _months:
@@ -2967,7 +2945,7 @@ def render_daily():
         st.markdown("#### 🔌 联络线外送")
         try:
             import plotly.graph_objects as go
-            _c = pymysql.connect(**DB_CONFIG)
+            _c = get_conn()
             _dt = pd.read_sql("SELECT MAX(`日期`) d FROM daily_tie_line", _c)
             if not _dt.empty and _dt['d'].iloc[0] is not None:
                 # === 真实日度外送 ===
@@ -3035,7 +3013,7 @@ def render_daily():
                 "风速_10m > 8.0 AND 雷暴 = 0 AND 降水 > 0.1\n"
                 "→ 黄色预警(加强监护)", language="text")
         try:
-            _conn = pymysql.connect(**DB_CONFIG)
+            _conn = get_conn()
             _df_w = pd.read_sql(
                 "SELECT `时间`,`点位名称`,`风速_10m`,`降水_mm`,`雷暴` FROM weather_hourly "
                 "WHERE `时间` >= NOW() AND `时间` < DATE_ADD(NOW(), INTERVAL 10 DAY) "
