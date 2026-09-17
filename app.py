@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
-"""甘肃电网检修预测系统 · 单页报告 + 数据台账
-按用户反馈简化: 砍掉 6 页仪表盘, 主页面=4 层预测报告, 副页=数据导出.
-"""
+# """甘肃电网检修预测系统 · 单页报告 + 数据台账
+# 按用户反馈简化: 砍掉 6 页仪表盘, 主页面=4 层预测报告, 副页=数据导出.
+# """
 import re
 import streamlit as st
 import pandas as pd
@@ -11,10 +11,111 @@ from scipy.stats import poisson
 from datetime import datetime
 
 # ==================== 配置 ====================
-DB_CONFIG = {
-    "host": "localhost", "port": 3306, "user": "root",
-    "password": "123456", "database": "power_maintenance", "charset": "utf8mb4",
+# 发布版(GitHub/Streamlit Cloud)无本地 MySQL, 改用同目录 SQLite 数据库.
+import sqlite3 as _sqlite3
+from datetime import datetime as _dt, date as _date
+import sys
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "power_data.db")
+
+# 表名映射: dashboard.py 里的 MySQL 表名 -> SQLite 里的英文表名
+_TABLE_MAP = {
+    "检修记录": "maint",
+    "月度平衡": "balance",
+    "断面限额": "section",
+    "月度披露报告": "disclosure",
+    "月度交易计划": "trade_plan",
+    "联络线分时": "tieline",
+    "weather_hourly": "weather",
+    "daily_spot_price": "spot_price",
+    "daily_renewable": "daily_renewable",
+    "daily_load": "daily_load",
+    "daily_tie_line": "daily_tie_line",
 }
+
+
+class _SQLiteCursor:
+    """兼容 MySQL cursor 的 SQLite cursor 包装, 负责 SQL 方言转换."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    @staticmethod
+    def _translate(sql, params=None):
+        params = list(params) if params else []
+        # 1) 表名映射
+        for cn, en in _TABLE_MAP.items():
+            import re
+            sql = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(cn) + r"(?![A-Za-z0-9_])", en, sql)
+        # 2) 去掉 MySQL 反引号(SQLite 中文列名可直接用)
+        sql = sql.replace("`", "")
+        # 3) MySQL 日期函数 -> SQLite
+        import re
+        # DATE_ADD(NOW(), INTERVAL %s DAY) 或 DATE_ADD(NOW(), INTERVAL 10 DAY)
+        def _date_add_repl(m):
+            nonlocal params
+            placeholder = m.group(1)
+            if placeholder == "%s" and params:
+                val = params.pop(0)
+            else:
+                val = placeholder.strip()
+            return f"datetime('now', '+{val} day')"
+        sql = re.sub(r"DATE_ADD\(\s*NOW\(\)\s*,\s*INTERVAL\s+(%s|\d+)\s+DAY\s*\)", _date_add_repl, sql)
+        # NOW()
+        sql = sql.replace("NOW()", "datetime('now')")
+        # CURDATE()
+        sql = sql.replace("CURDATE()", "date('now')")
+        # YEAR/MONTH/DAY
+        sql = re.sub(r"YEAR\(([^)]+)\)", r"CAST(strftime('%Y', \1) AS INTEGER)", sql)
+        sql = re.sub(r"MONTH\(([^)]+)\)", r"CAST(strftime('%m', \1) AS INTEGER)", sql)
+        sql = re.sub(r"DAY\(([^)]+)\)", r"CAST(strftime('%d', \1) AS INTEGER)", sql)
+        # DATE_FORMAT(日期, '%Y-%m')
+        sql = re.sub(r"DATE_FORMAT\(([^,]+),\s*'([^']+)'\s*\)", r"strftime('\2', \1)", sql)
+        # 4) 参数占位符 %s -> ?
+        sql = sql.replace("%s", "?")
+        return sql, params
+
+    def execute(self, sql, params=None):
+        sql, params = self._translate(sql, params)
+        if params:
+            return self._cur.execute(sql, params)
+        return self._cur.execute(sql)
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _SQLiteConnection:
+    def __init__(self, path):
+        self._conn = _sqlite3.connect(path)
+        self._register_funcs()
+
+    def _register_funcs(self):
+        self._conn.create_function("NOW", 0, lambda: _dt.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self._conn.create_function("CURDATE", 0, lambda: _date.today().strftime("%Y-%m-%d"))
+
+    def cursor(self):
+        return _SQLiteCursor(self._conn.cursor())
+
+    def close(self):
+        return self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _FakePyMySQL:
+    @staticmethod
+    def connect(**kwargs):
+        return _SQLiteConnection(DB_PATH)
+
+
+sys.modules["pymysql"] = _FakePyMySQL()
 
 # 第一步: 设备类型 → 容量影响权重(粗略版).
 # 依据"是否直接损失发电/供电能力"分档; 后续补到设备精确MW后可替换为真实容量.
