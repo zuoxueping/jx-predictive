@@ -787,7 +787,7 @@ def weather_daily_grid(days=10):
             total = int(total or 0); bad = int(bad or 0)
             if total == 0:
                 continue
-            out.append((d.strftime("%m-%d"), round((total - bad) / total * 100), bad, total))
+            out.append((pd.to_datetime(d).strftime("%m-%d"), round((total - bad) / total * 100), bad, total))
         return out
     except Exception:
         return []
@@ -821,7 +821,7 @@ def point_weather_matrix(days=10):
             main = "风" if (w_b or 0) >= max(t_b or 0, r_b or 0, te_b or 0) else \
                    "雷" if (t_b or 0) >= max(r_b or 0, te_b or 0) else \
                    "雨" if (r_b or 0) >= (te_b or 0) else "温"
-            out.append({"点位": pt, "日期": d.strftime("%m-%d"),
+            out.append({"点位": pt, "日期": pd.to_datetime(d).strftime("%m-%d"),
                         "可作业率%": round((total - bad) / total * 100),
                         "受限原因": main if bad > 0 else "—"})
         return out
