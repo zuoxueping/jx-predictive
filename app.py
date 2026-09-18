@@ -47,7 +47,12 @@ class _SQLiteCursor:
             sql = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(cn) + r"(?![A-Za-z0-9_])", en, sql)
         # 2) 去掉 MySQL 反引号(SQLite 中文列名可直接用)
         sql = sql.replace("`", "")
+        # 2.5) 防御: 归一化源文件里偶发的双百分号 %% -> % (否则 strftime 拿到 %% 返回字面量)
+        sql = sql.replace("%%", "%")
         # 3) MySQL 日期函数 -> SQLite
+        # 3.0) GREATEST(a, b) -> SQLite 标量 MAX(a, b)
+        #      必须在 NOW() 替换之前做: 此时参数是 %s / NOW(), 均无括号, 正则才能正确捕获两个参数.
+        sql = re.sub(r"GREATEST\(([^)]+),\s*([^)]+)\)", lambda m: f"MAX({m.group(1)}, {m.group(2)})", sql)
         def _date_add_repl(m):
             nonlocal params
             placeholder = m.group(1)
@@ -59,10 +64,10 @@ class _SQLiteCursor:
         sql = re.sub(r"DATE_ADD\(\s*NOW\(\)\s*,\s*INTERVAL\s+(%s|\d+)\s+DAY\s*\)", _date_add_repl, sql)
         sql = sql.replace("NOW()", "datetime('now')")
         sql = sql.replace("CURDATE()", "date('now')")
-        sql = re.sub(r"YEAR\(([^)]+)\)", r"CAST(strftime('%Y', \1) AS INTEGER)", sql)
-        sql = re.sub(r"MONTH\(([^)]+)\)", r"CAST(strftime('%m', \1) AS INTEGER)", sql)
-        sql = re.sub(r"DAY\(([^)]+)\)", r"CAST(strftime('%d', \1) AS INTEGER)", sql)
-        sql = re.sub(r"DATE_FORMAT\(([^,]+),\s*'([^']+)'\s*\)", r"strftime('\2', \1)", sql)
+        sql = re.sub(r"YEAR\(([^)]+)\)", lambda m: f"CAST(strftime('%Y', {m.group(1)}) AS INTEGER)", sql)
+        sql = re.sub(r"MONTH\(([^)]+)\)", lambda m: f"CAST(strftime('%m', {m.group(1)}) AS INTEGER)", sql)
+        sql = re.sub(r"DAY\(([^)]+)\)", lambda m: f"CAST(strftime('%d', {m.group(1)}) AS INTEGER)", sql)
+        sql = re.sub(r"DATE_FORMAT\(([^,]+),\s*'([^']+)'\s*\)", lambda m: f"strftime('{m.group(2)}', {m.group(1)})", sql)
         # 4) 参数占位符 %s -> ?
         sql = sql.replace("%s", "?")
         return sql, params
@@ -2869,7 +2874,7 @@ def render_daily():
                 y, mo = int(ym[:4]), int(ym[5:7])
                 _days = pd.read_sql(
                     "SELECT DISTINCT DAY(`日期`) d FROM daily_spot_price "
-                    "WHERE DATE_FORMAT(`日期`,'%%Y-%%m')=%s ORDER BY d", _c, params=(ym,))['d'].tolist()
+                    "WHERE DATE_FORMAT(`日期`,'%Y-%m')=%s ORDER BY d", _c, params=(ym,))['d'].tolist()
                 d = st.selectbox("选择日期", _days, index=len(_days) - 1, key="spot_d")
                 _day = pd.read_sql(
                     "SELECT `时段`,`分段`,`日前价_元MWh`,`实时价_元MWh`,`出清均价_元MWh` "
@@ -2919,7 +2924,7 @@ def render_daily():
                 st.markdown("**📅 当月逐日均价(日前 vs 实时)**")
                 _m = pd.read_sql(
                     "SELECT DAY(`日期`) d, AVG(`日前价_元MWh`) da, AVG(`实时价_元MWh`) rt "
-                    "FROM daily_spot_price WHERE DATE_FORMAT(`日期`,'%%Y-%%m')=%s GROUP BY d ORDER BY d", _c, params=(ym,))
+                    "FROM daily_spot_price WHERE DATE_FORMAT(`日期`,'%Y-%m')=%s GROUP BY d ORDER BY d", _c, params=(ym,))
                 fig2 = go.Figure()
                 fig2.add_trace(go.Bar(x=_m['d'], y=_m['da'], name='日前日均'))
                 fig2.add_trace(go.Bar(x=_m['d'], y=_m['rt'], name='实时日均'))

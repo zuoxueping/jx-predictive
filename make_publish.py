@@ -42,7 +42,12 @@ class _SQLiteCursor:
             sql = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(cn) + r"(?![A-Za-z0-9_])", en, sql)
         # 2) 去掉 MySQL 反引号(SQLite 中文列名可直接用)
         sql = sql.replace("`", "")
+        # 2.5) 防御: 归一化源文件里偶发的双百分号 %% -> % (否则 strftime 拿到 %% 返回字面量)
+        sql = sql.replace("%%", "%")
         # 3) MySQL 日期函数 -> SQLite
+        # 3.0) GREATEST(a, b) -> SQLite 标量 MAX(a, b)
+        #      必须在 NOW() 替换之前做: 此时参数是 %s / NOW(), 均无括号, 正则才能正确捕获两个参数.
+        sql = re.sub(r"GREATEST\(([^)]+),\s*([^)]+)\)", lambda m: f"MAX({m.group(1)}, {m.group(2)})", sql)
         def _date_add_repl(m):
             nonlocal params
             placeholder = m.group(1)
@@ -54,10 +59,10 @@ class _SQLiteCursor:
         sql = re.sub(r"DATE_ADD\\(\\s*NOW\\(\\)\\s*,\\s*INTERVAL\\s+(%s|\\d+)\\s+DAY\\s*\\)", _date_add_repl, sql)
         sql = sql.replace("NOW()", "datetime('now')")
         sql = sql.replace("CURDATE()", "date('now')")
-        sql = re.sub(r"YEAR\\(([^)]+)\\)", r"CAST(strftime('%Y', \\1) AS INTEGER)", sql)
-        sql = re.sub(r"MONTH\\(([^)]+)\\)", r"CAST(strftime('%m', \\1) AS INTEGER)", sql)
-        sql = re.sub(r"DAY\\(([^)]+)\\)", r"CAST(strftime('%d', \\1) AS INTEGER)", sql)
-        sql = re.sub(r"DATE_FORMAT\\(([^,]+),\\s*'([^']+)'\\s*\\)", r"strftime('\\2', \\1)", sql)
+        sql = re.sub(r"YEAR\\(([^)]+)\\)", lambda m: f"CAST(strftime('%Y', {m.group(1)}) AS INTEGER)", sql)
+        sql = re.sub(r"MONTH\\(([^)]+)\\)", lambda m: f"CAST(strftime('%m', {m.group(1)}) AS INTEGER)", sql)
+        sql = re.sub(r"DAY\\(([^)]+)\\)", lambda m: f"CAST(strftime('%d', {m.group(1)}) AS INTEGER)", sql)
+        sql = re.sub(r"DATE_FORMAT\\(([^,]+),\\s*'([^']+)'\\s*\\)", lambda m: f"strftime('{m.group(2)}', {m.group(1)})", sql)
         # 4) 参数占位符 %s -> ?
         sql = sql.replace("%s", "?")
         return sql, params
