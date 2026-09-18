@@ -2567,7 +2567,7 @@ def render_review():
         import plotly.graph_objects as go
         _c = get_conn()
         _ms = pd.read_sql(
-            "SELECT DATE_FORMAT(`日期`,'%Y-%m') ym, "
+            "SELECT DATE_FORMAT(`日期`,'%%Y-%%m') ym, "
             "ROUND(AVG(`日前价_元MWh`),1) da, ROUND(AVG(`实时价_元MWh`),1) rt, "
             "ROUND(AVG(`偏差_元MWh`),1) sp "
             "FROM daily_spot_price GROUP BY ym ORDER BY ym", _c)
@@ -2670,6 +2670,7 @@ def _build_daily_summary():
             "SELECT `时间`,`点位名称`,`风速_10m`,`降水_mm`,`雷暴` FROM weather_hourly "
             "WHERE `时间`>=NOW() AND `时间`<DATE_ADD(NOW(),INTERVAL 10 DAY)", _c)
         if not _w.empty:
+            _w["时间"] = pd.to_datetime(_w["时间"])
             _w["触发"] = (_w["风速_10m"] > 10.7) | (_w["雷暴"] == 1) | (_w["降水_mm"] > 0.5)
             _h = _w[_w["触发"]].copy()
             if not _h.empty:
@@ -2887,13 +2888,13 @@ def render_daily():
             from datetime import date as _date
             _c = get_conn()
             _months = pd.read_sql(
-                "SELECT DISTINCT DATE_FORMAT(`日期`,'%Y-%m') ym FROM daily_spot_price ORDER BY ym", _c)['ym'].tolist()
+                "SELECT DISTINCT DATE_FORMAT(`日期`,'%%Y-%%m') ym FROM daily_spot_price ORDER BY ym", _c)['ym'].tolist()
             if _months:
                 ym = st.selectbox("选择月份", _months, index=len(_months) - 1, key="spot_ym")
                 y, mo = int(ym[:4]), int(ym[5:7])
                 _days = pd.read_sql(
                     "SELECT DISTINCT DAY(`日期`) d FROM daily_spot_price "
-                    "WHERE DATE_FORMAT(`日期`,'%Y-%m')=%s ORDER BY d", _c, params=(ym,))['d'].tolist()
+                    "WHERE DATE_FORMAT(`日期`,'%%Y-%%m')=%s ORDER BY d", _c, params=(ym,))['d'].tolist()
                 d = st.selectbox("选择日期", _days, index=len(_days) - 1, key="spot_d")
                 _day = pd.read_sql(
                     "SELECT `时段`,`分段`,`日前价_元MWh`,`实时价_元MWh`,`出清均价_元MWh` "
@@ -2943,7 +2944,7 @@ def render_daily():
                 st.markdown("**📅 当月逐日均价(日前 vs 实时)**")
                 _m = pd.read_sql(
                     "SELECT DAY(`日期`) d, AVG(`日前价_元MWh`) da, AVG(`实时价_元MWh`) rt "
-                    "FROM daily_spot_price WHERE DATE_FORMAT(`日期`,'%Y-%m')=%s GROUP BY d ORDER BY d", _c, params=(ym,))
+                    "FROM daily_spot_price WHERE DATE_FORMAT(`日期`,'%%Y-%%m')=%s GROUP BY d ORDER BY d", _c, params=(ym,))
                 fig2 = go.Figure()
                 fig2.add_trace(go.Bar(x=_m['d'], y=_m['da'], name='日前日均'))
                 fig2.add_trace(go.Bar(x=_m['d'], y=_m['rt'], name='实时日均'))
@@ -3044,6 +3045,7 @@ def render_daily():
                 "ORDER BY `时间`", _conn)
             _conn.close()
             if not _df_w.empty:
+                _df_w["时间"] = pd.to_datetime(_df_w["时间"])
                 _df_w["触发"] = (
                     (_df_w["风速_10m"] > 10.7) |
                     (_df_w["雷暴"] == 1) |
