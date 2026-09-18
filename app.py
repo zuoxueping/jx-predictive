@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
-"""甘肃电网检修预测系统 · 单页报告 + 数据台账
-按用户反馈简化: 砍掉 6 页仪表盘, 主页面=4 层预测报告, 副页=数据导出.
-"""
+# 甘肃电网检修预测系统 · 单页报告 + 数据台账
+# 按用户反馈简化: 砍掉 6 页仪表盘, 主页面=4 层预测报告, 副页=数据导出.
 import re
 import streamlit as st
 import pandas as pd
@@ -13,7 +12,7 @@ from datetime import datetime
 # ==================== 配置 ====================
 # 发布版(GitHub/Streamlit Cloud)无本地 MySQL, 改用同目录 SQLite 数据库.
 import sqlite3
-from datetime import datetime as _dt, date as _date
+from datetime import datetime as _dt, date as _date, timedelta as _td, timezone as _tz
 import re
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "power_data.db")
@@ -60,10 +59,9 @@ class _SQLiteCursor:
                 val = params.pop(0)
             else:
                 val = placeholder.strip()
-            return f"datetime('now', '+{val} day')"
+            return f"datetime(NOW(), '+{val} day')"
         sql = re.sub(r"DATE_ADD\(\s*NOW\(\)\s*,\s*INTERVAL\s+(%s|\d+)\s+DAY\s*\)", _date_add_repl, sql)
-        sql = sql.replace("NOW()", "datetime('now')")
-        sql = sql.replace("CURDATE()", "date('now')")
+        # NOW()/CURDATE() 不在这里替换, 由 _SQLiteConnection.create_function 实现, 统一按北京时间(UTC+8)返回.
         sql = re.sub(r"YEAR\(([^)]+)\)", lambda m: f"CAST(strftime('%Y', {m.group(1)}) AS INTEGER)", sql)
         sql = re.sub(r"MONTH\(([^)]+)\)", lambda m: f"CAST(strftime('%m', {m.group(1)}) AS INTEGER)", sql)
         sql = re.sub(r"DAY\(([^)]+)\)", lambda m: f"CAST(strftime('%d', {m.group(1)}) AS INTEGER)", sql)
@@ -92,8 +90,9 @@ class _SQLiteConnection(sqlite3.Connection):
     """SQLite 连接子类: pandas.read_sql 能识别为 sqlite3 连接, 且 cursor() 做 SQL 翻译."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.create_function("NOW", 0, lambda: _dt.now().strftime("%Y-%m-%d %H:%M:%S"))
-        self.create_function("CURDATE", 0, lambda: _date.today().strftime("%Y-%m-%d"))
+        # Streamlit Cloud 服务器为 UTC; 数据库里的 weather 时间均为北京时间, 所以 NOW()/CURDATE() 统一按 UTC+8 返回.
+        self.create_function("NOW", 0, lambda: (_dt.now(_tz.utc) + _td(hours=8)).strftime("%Y-%m-%d %H:%M:%S"))
+        self.create_function("CURDATE", 0, lambda: (_dt.now(_tz.utc) + _td(hours=8)).date().strftime("%Y-%m-%d"))
 
     def cursor(self):
         return _SQLiteCursor(super().cursor())
@@ -957,8 +956,7 @@ def render_weather_maint(target_year, target_month, df_maint, df_sec):
     """
     st.write("---")
     st.markdown("### 🌤 天气-检修适配分析")
-    st.caption("天气源: weather_hourly(12 点位, Open-Meteo, 模式格点预报). "
-               "⚠️ Open-Meteo 绝对温度与实测可能偏差 4~5℃, 本块仅用于趋势与受限阈值判断, 不作气温实测展示. "
+    st.caption("天气源: weather_hourly(12 点位, Open-Meteo 模式格点预报). "
                "受限阈值: 风>10.7m/s 或 雷暴 或 降水>0.5mm 或 极端温度.")
 
     # ===== ① 关键检修 × 天气 × 交易决策矩阵(最前: 最直接给交易建议) =====
