@@ -950,6 +950,28 @@ def weather_maint_risk(df_maint, target_year, target_month):
         return []
 
 
+def _operability_bg(v):
+    """纯 pandas 单元格着色(不依赖 matplotlib): 红(受限)->黄->绿(可作业). 40~100 映射."""
+    try:
+        import pandas as pd
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+    except Exception:
+        return ""
+    try:
+        t = (float(v) - 40) / (100 - 40)
+    except Exception:
+        return ""
+    t = max(0.0, min(1.0, t))
+    if t < 0.5:
+        f = t / 0.5
+        r, g, b = 255, int(round(255 * f)), 0
+    else:
+        f = (t - 0.5) / 0.5
+        r, g, b = int(round(255 * (1 - f))), 255, 0
+    return f"background-color: rgb({r},{g},{b})"
+
+
 def render_weather_maint(target_year, target_month, df_maint, df_sec):
     """天气 × 已有数据结合: ① 关键检修-天气-交易决策矩阵 ② 点位可作业矩阵 ③ 外送双重风险.
     核心逻辑: 天气好不好不重要, 影不影响关键检修才重要.
@@ -1014,9 +1036,8 @@ def render_weather_maint(target_year, target_month, df_maint, df_sec):
             region_order = ["兰州", "酒泉", "嘉峪关", "张掖", "武威", "定西",
                             "平凉", "庆阳", "临夏", "合作", "天水", "陇南"]
             pivot = pivot.reindex([p for p in region_order if p in pivot.index])
-            st.dataframe(pivot.style.background_gradient(
-                cmap="RdYlGn", vmin=40, vmax=100
-            ).format("{:.0f}"), use_container_width=True)
+            st.dataframe(pivot.style.map(_operability_bg).format("{:.0f}", na_rep=""),
+                         use_container_width=True)
             st.caption("绿=可作业率高 红=受限严重. 点位按甘肃检修区域分组; "
                        "查具体某天某点是否适合高空/吊装作业 → 直接看格子.")
     else:
