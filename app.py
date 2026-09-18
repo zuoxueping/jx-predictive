@@ -793,7 +793,8 @@ def weather_daily_grid(days=10):
                 continue
             out.append((pd.to_datetime(d).strftime("%m-%d"), round((total - bad) / total * 100), bad, total))
         return out
-    except Exception:
+    except Exception as _e:
+        st.error(f"天气矩阵加载失败: {_e}")
         return []
 
 
@@ -829,7 +830,8 @@ def point_weather_matrix(days=10):
                         "可作业率%": round((total - bad) / total * 100),
                         "受限原因": main if bad > 0 else "—"})
         return out
-    except Exception:
+    except Exception as _e:
+        st.error(f"12点位天气矩阵加载失败: {_e}")
         return []
 
 
@@ -1036,8 +1038,12 @@ def render_weather_maint(target_year, target_month, df_maint, df_sec):
             region_order = ["兰州", "酒泉", "嘉峪关", "张掖", "武威", "定西",
                             "平凉", "庆阳", "临夏", "合作", "天水", "陇南"]
             pivot = pivot.reindex([p for p in region_order if p in pivot.index])
-            st.dataframe(pivot.style.map(_operability_bg).format("{:.0f}", na_rep=""),
-                         use_container_width=True)
+            try:
+                st.dataframe(pivot.style.map(_operability_bg).format("{:.0f}", na_rep=""),
+                             use_container_width=True)
+            except Exception:
+                st.dataframe(pivot, use_container_width=True)
+                st.caption("(云端环境简化显示, 颜色标注已关闭)")
             st.caption("绿=可作业率高 红=受限严重. 点位按甘肃检修区域分组; "
                        "查具体某天某点是否适合高空/吊装作业 → 直接看格子.")
     else:
@@ -2567,7 +2573,7 @@ def render_review():
         import plotly.graph_objects as go
         _c = get_conn()
         _ms = pd.read_sql(
-            "SELECT DATE_FORMAT(`日期`,'%%Y-%%m') ym, "
+            "SELECT DATE_FORMAT(`日期`,'%Y-%m') ym, "
             "ROUND(AVG(`日前价_元MWh`),1) da, ROUND(AVG(`实时价_元MWh`),1) rt, "
             "ROUND(AVG(`偏差_元MWh`),1) sp "
             "FROM daily_spot_price GROUP BY ym ORDER BY ym", _c)
@@ -2888,7 +2894,7 @@ def render_daily():
             from datetime import date as _date
             _c = get_conn()
             _months = pd.read_sql(
-                "SELECT DISTINCT DATE_FORMAT(`日期`,'%%Y-%%m') ym FROM daily_spot_price ORDER BY ym", _c)['ym'].tolist()
+                "SELECT DISTINCT DATE_FORMAT(`日期`,'%Y-%m') ym FROM daily_spot_price ORDER BY ym", _c)['ym'].tolist()
             if _months:
                 ym = st.selectbox("选择月份", _months, index=len(_months) - 1, key="spot_ym")
                 y, mo = int(ym[:4]), int(ym[5:7])
