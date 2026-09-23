@@ -864,23 +864,25 @@ def maint_weather_decision(df_maint, target_year, target_month, top_n=8):
 
     try:
         conn = get_conn()
-        cur = conn.cursor()
+        # 一次性读出天气, 用 pandas 过滤区间(兼容 MySQL 与 SQLite 发布版, 避免 GREATEST/NOW/Timestamp 绑定)
+        w = pd.read_sql("SELECT 时间, 风速_10m, 雷暴, 降水_mm, 气温_2m FROM weather_hourly", conn)
+        w["时间"] = pd.to_datetime(w["时间"])
+        now = datetime.now()
         out = []
         for _, r in sub.iterrows():
             sd = r.get("开始日期_dt"); ed = r.get("结束日期_dt")
             if pd.isna(sd):
                 continue
             ed = ed if pd.notna(ed) else sd
-            cur.execute(
-                "SELECT COUNT(*) AS total, "
-                "       SUM(CASE WHEN 风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5 "
-                "                  OR 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS bad "
-                "FROM weather_hourly WHERE 时间 >= GREATEST(%s, NOW()) AND 时间 <= %s",
-                (sd, ed))
-            rr = cur.fetchone()
-            total = int(rr[0] or 0); bad = int(rr[1] or 0)
+            subw = w[(w["时间"] >= max(sd, now)) & (w["时间"] <= ed)]
+            total = len(subw)
             if total == 0:
                 continue
+            bad = int(((subw["风速_10m"] > 10.7) |
+                       (subw["雷暴"].fillna(0).astype(int) == 1) |
+                       (subw["降水_mm"] > 0.5) |
+                       (subw["气温_2m"] > 40) |
+                       (subw["气温_2m"] < -15)).sum())
             bad_rate = bad / total
             sev = int(r["_sev"]); days = int(r["_days"])
             imp = int(r["_imp"])
@@ -924,24 +926,25 @@ def weather_maint_risk(df_maint, target_year, target_month):
         return []
     try:
         conn = get_conn()
-        cur = conn.cursor()
+        # 一次性读出天气, 用 pandas 过滤区间(兼容 MySQL 与 SQLite 发布版)
+        w = pd.read_sql("SELECT 时间, 风速_10m, 雷暴, 降水_mm, 气温_2m FROM weather_hourly", conn)
+        w["时间"] = pd.to_datetime(w["时间"])
+        now = datetime.now()
         out = []
         for _, r in sub.iterrows():
             sd = r.get("开始日期_dt"); ed = r.get("结束日期_dt")
             if pd.isna(sd):
                 continue
             ed = ed if pd.notna(ed) else sd
-            # 只统计检修区间与未来天气窗口的重叠部分(GREATEST 取较晚起点)
-            cur.execute(
-                "SELECT COUNT(*) AS total, "
-                "       SUM(CASE WHEN 风速_10m > 10.7 OR 雷暴 = 1 OR 降水_mm > 0.5 "
-                "                  OR 气温_2m > 40 OR 气温_2m < -15 THEN 1 ELSE 0 END) AS bad "
-                "FROM weather_hourly WHERE 时间 >= GREATEST(%s, NOW()) AND 时间 <= %s",
-                (sd, ed))
-            rr = cur.fetchone()
-            total = int(rr[0] or 0); bad = int(rr[1] or 0)
+            subw = w[(w["时间"] >= max(sd, now)) & (w["时间"] <= ed)]
+            total = len(subw)
             if total == 0:
                 continue  # 检修区间不在天气覆盖窗, 跳过
+            bad = int(((subw["风速_10m"] > 10.7) |
+                       (subw["雷暴"].fillna(0).astype(int) == 1) |
+                       (subw["降水_mm"] > 0.5) |
+                       (subw["气温_2m"] > 40) |
+                       (subw["气温_2m"] < -15)).sum())
             rate = bad / total
             lvl = "高" if rate >= 0.4 else ("中" if rate >= 0.25 else "低")
             out.append((str(r.get("停电设备", "")), sd.strftime("%Y-%m-%d"),
@@ -3063,10 +3066,14 @@ def render_daily():
                     if _df['全社会负荷_MW'].notna().any():
                         fig.add_trace(go.Scatter(x=_df['时段'], y=_df['全社会负荷_MW'], mode='lines', name='全社会负荷',
                                                 line=dict(color='#16A085', dash='dot')))
-                    # 气温叠加(若有兰州该日数据)
+                    # 气温叠加(若有兰州该日数据); 全量取出后用 pandas 过滤(兼容 SQLite 无 HOUR/DATE 函数)
                     _wt = pd.read_sql(
-                        "SELECT HOUR(`时间`) h, `气温_2m` t FROM weather_hourly "
-                        "WHERE DATE(`时间`)=%s AND `点位名称`='兰州' ORDER BY `时间`", _c, params=(sd,))
+                        "SELECT `时间`, `气温_2m` t FROM weather_hourly WHERE `点位名称`='兰州'", _c)
+                    if not _wt.empty:
+                        _wt["时间"] = pd.to_datetime(_wt["时间"])
+                        _wt = _wt[_wt["时间"].dt.date == pd.to_datetime(sd).date()]
+                        _wt = _wt.sort_values("时间").copy()
+                        _wt["h"] = _wt["时间"].dt.hour
                     if not _wt.empty and _wt['t'].notna().any():
                         fig.add_trace(go.Scatter(x=_wt['h'], y=_wt['t'], mode='lines', name='兰州气温',
                                                 yaxis='y2', line=dict(color='#E67E22', dash='dash')))
