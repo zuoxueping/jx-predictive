@@ -884,7 +884,7 @@ def maint_weather_decision(df_maint, target_year, target_month, top_n=8):
             bad_rate = bad / total
             sev = int(r["_sev"]); days = int(r["_days"])
             imp = int(r["_imp"])
-            equip = str(r.get("停电设备", ""))[:30]
+            equip = f"{r.get('申请单位','')} {r.get('停电设备','')}"[:42]
             level = str(r.get("检修级别", "—"))
             # 行动建议
             if bad_rate < 0.15:
@@ -1016,12 +1016,14 @@ def render_weather_maint(target_year, target_month, df_maint, df_sec):
         # 表格(用 dataframe 而不是 markdown, 列宽更友好)
         import pandas as pd
         df_d = pd.DataFrame(decisions, columns=[
-            "设备", "级别", "开始", "结束", "持续(天)", "重要度",
-            "受限%", "行动建议", "调整方向"
+            "设备(厂站+设备)", "级别", "开始", "结束", "持续(天)", "重要度",
+            "受限%(天气)", "行动建议", "调整方向"
         ])
         st.dataframe(df_d, use_container_width=True, hide_index=True)
         st.caption("重要度 = 等级分(A=5/B=4/C=3/D=2/改造大修=3/其他=1) × 持续天数; "
-                   "受限% = 检修区间内天气受限小时比例.")
+                   "受限%(天气) = 检修区间内、天气满足受限阈值的小时数 ÷ 总小时数 ×100%"
+                   "(阈值: 风>10.7m/s 或 雷暴 或 降水>0.5mm 或 极端温度); "
+                   "即'这段时间有多大比例可能因天气无法作业'。")
     else:
         st.info("当月无未来 10 天内开始的检修, 暂无适配决策.")
 
@@ -1131,13 +1133,134 @@ def effective_reserve(reserve_lut, w_avg, target):
     return {"month": target, "cap": cap, "load": load, "source": src,
             "nominal": nominal, "w_avg": w, "eff": eff}
 
+# ==================== 电价 / 风光出力 预测辅助(交易前) ====================
+# 说明: 现货价表(daily_spot_price)仅统一点(日前/实时), 河东/河西价差待运营报告节点价接入;
+# 以下价格预测均基于统一点。风光出力用 weather_hourly 天气代理(非实测出力)。
+HEXI_POINTS = ["酒泉", "嘉峪关", "张掖", "武威"]                 # 河西(风光基地)
+HEDONG_POINTS = ["兰州", "临夏", "天水", "定西", "平凉", "庆阳", "甘南", "陇南"]  # 河东
+
+def _pf_hours():
+    """标准峰平谷时段划分(甘肃现货参考): 峰 11-16,22-23; 平 8-10,17-21; 谷 0-7。"""
+    peak = list(range(11, 17)) + [22, 23]
+    flat = [8, 9, 10, 17, 18, 19, 20, 21]
+    valley = list(range(0, 8))
+    return peak, flat, valley
+
+def price_monthly_forecast(conn, ty, tm):
+    """月度统一点日前价预测: P50=同月历史均值; 区间=±1.28×同月小时std(正态近似)。
+    返回峰/平/谷均价(同一月内按时段聚合)。无同月历史时回退全样本基线。
+    注: 全量取出后在 pandas 过滤, 兼容 MySQL 与 SQLite(发布版)。"""
+    try:
+        d = pd.read_sql("SELECT 日期, 时段 h, 日前价_元MWh da FROM daily_spot_price", conn)
+        if d.empty:
+            return None
+        d["月"] = pd.to_datetime(d["日期"], errors="coerce").dt.month
+        dm = d[d["月"] == tm]
+        if dm.empty:
+            src = "全样本基线(无同月历史)"; dd = d
+        else:
+            src = f"同月历史(MONTH={tm:02d})"; dd = dm
+        p50 = float(dd["da"].mean())
+        sd = float(dd["da"].std()) if len(dd) > 1 else 0.0
+        lo = max(40.0, p50 - 1.28 * sd)
+        hi = p50 + 1.28 * sd
+        peak, flat, valley = _pf_hours()
+        def _a(hs):
+            v = dd[dd["h"].isin(hs)]["da"]
+            return float(v.mean()) if len(v) else None
+        return {"p50": p50, "lo": lo, "hi": hi, "n": len(dd), "src": src,
+                "peak": _a(peak), "flat": _a(flat), "valley": _a(valley)}
+    except Exception as _e:
+        return {"error": str(_e)}
+
+def price_daily_forecast(conn, target_date):
+    """次日/指定日 24 点日前价预测: 用同月同时段基线(均值±1.28σ, σ取日间波动)。
+    无同月历史时回退全样本小时基线。返回 DataFrame(h,p50,lo,hi) 与数据来源说明。
+    注: 全量取出后在 pandas 计算均值/标准差, 兼容 MySQL 与 SQLite(发布版, 避免 STD() 方言)。"""
+    mo = target_date.month
+    try:
+        d = pd.read_sql("SELECT 日期, 时段 h, 日前价_元MWh da FROM daily_spot_price", conn)
+        if d.empty:
+            return None
+        d["月"] = pd.to_datetime(d["日期"], errors="coerce").dt.month
+        dm = d[d["月"] == mo]
+        if dm.empty:
+            src = "全样本基线(无同月历史)"; dd = d
+        else:
+            src = f"{mo}月同月历史"; dd = dm
+        rows = []
+        for h in range(24):
+            sub = dd[dd["h"] == h]["da"]
+            if len(sub):
+                mu = float(sub.mean())
+                sd = float(sub.std()) if len(sub) > 1 else 0.0
+            else:
+                mu = float(dd["da"].mean())
+                sd = float(dd["da"].std())
+            rows.append({"h": h, "p50": mu, "lo": max(40.0, mu - 1.28 * sd), "hi": mu + 1.28 * sd})
+        return {"df": pd.DataFrame(rows), "src": src}
+    except Exception as _e:
+        return {"error": str(_e)}
+
+def renewable_potential(conn, target_date):
+    """天气代理的风光出力潜力(非实测出力): 河西/河东 风电潜力(120m风速→容量因子近似) + 光伏潜力(云量反向)。"""
+    try:
+        w = pd.read_sql("SELECT 点位名称, 风速_120m, 总云量_pct FROM weather_hourly WHERE DATE(时间)=%s",
+                        conn, params=(target_date.strftime("%Y-%m-%d"),))
+        if w.empty:
+            return None
+        w["风速_120m"] = pd.to_numeric(w["风速_120m"], errors="coerce")
+        w["总云量_pct"] = pd.to_numeric(w["总云量_pct"], errors="coerce")
+        def _wind_idx(sub):
+            ws = sub["风速_120m"].mean()
+            if pd.isna(ws):
+                return None
+            # 简化容量因子: 切入3 额定12 切出25 m/s
+            if ws >= 25:
+                return 0.0
+            return min(100.0, max(0.0, (ws - 3.0) / (12.0 - 3.0) * 100.0))
+        hedong = w[w["点位名称"].isin(HEDONG_POINTS)]
+        hexi = w[w["点位名称"].isin(HEXI_POINTS)]
+        wind_hd = _wind_idx(hedong) if not hedong.empty else None
+        wind_hx = _wind_idx(hexi) if not hexi.empty else None
+        solar = None
+        if w["总云量_pct"].notna().any():
+            solar = max(0.0, 100.0 - float(w["总云量_pct"].mean()))
+        return {"wind_hedong": wind_hd, "wind_hexi": wind_hx, "solar": solar}
+    except Exception as _e:
+        return {"error": str(_e)}
+
+def render_price_forecast_card(conn, ty, tm):
+    """月度预测页用的『价格预测』卡片块(统一点; 河东/河西价差标红待补)。"""
+    st.markdown("#### 💰 价格预测（统一点 · 日前价）")
+    st.caption("数据源: daily_spot_price(已接入, 统一点)。方法: 同月历史均值作 P50, "
+               "±1.28×同月小时标准差作 P10/P90 置信区间(正态近似); 峰平谷按时段聚合。")
+    pf = price_monthly_forecast(conn, ty, tm)
+    if pf is None:
+        st.info("现货价数据不足, 暂无法预测。")
+        return
+    if "error" in pf:
+        st.caption(f"价格预测异常: {pf['error']}")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("月度均价 P50", f"{pf['p50']:.0f}", help="同月历史日前价均值")
+    with c2:
+        st.metric("置信区间", f"{pf['lo']:.0f}~{pf['hi']:.0f}", help="P10~P90 (±1.28σ)")
+    with c3:
+        st.metric("峰段均价", f"{pf['peak']:.0f}" if pf['peak'] else "—")
+    with c4:
+        st.metric("谷段均价", f"{pf['valley']:.0f}" if pf['valley'] else "—")
+    st.caption(f"数据来源: {pf['src']} (样本 {pf['n']} 小时)。"
+               "⚠ 当前仅统一点价; 河东/河西价差(第一信号)待运营报告节点价接入后补全(规划书已标红)。")
+
 # ==================== 单页报告 ====================
 def render_report():
     # 顶部标题 + 月份选择
     title_l, title_r = st.columns([3, 2])
     with title_l:
-        st.markdown("# 甘肃电网检修预测报告")
-        st.caption("数据来源: 甘肃省电力市场月度披露文件 + 历史同期规律")
+        st.markdown("# 📅 月度预测（交易前）")
+        st.caption("数据来源: 甘肃省电力市场月度披露文件 + 历史同期规律 + 现货价/天气。在交易前给出下个月整体的负荷/检修/出力/价格预判。")
     with title_r:
         # 可选月份: 已有历史 + 未来 6 个月
         avail_months = sorted(load_maint()["披露月份"].unique().tolist())
@@ -1176,6 +1299,59 @@ def render_report():
         render_month_detail(df, target)
         st.write("---")
         st.caption("以下为基于历史规律的预测 / 参考；当月实测明细见上方面板。")
+
+    # ===== 月度预测总览(交易前 · 下个月整体判断) =====
+    st.markdown("### 🧭 月度预测总览（交易前 · 下个月整体判断）")
+    st.caption("本区块在交易前给出『下个月整体』的负荷 / 检修 / 出力 / 价格预判; "
+               "检修详细预测见本页下方 ①~④, 价格/出力已有数据支撑, 负荷待接入。")
+    _conn0 = get_conn()
+
+    # 价格预测卡(真实)
+    render_price_forecast_card(_conn0, target_year, target_month)
+
+    # 出力置信度(天气代理)
+    st.markdown("#### 💨 出力置信度（天气代理 · 非实测出力）")
+    st.caption("数据源: weather_hourly(12 点位, 河西4站/河东8站)。方法: 120m 风速→容量因子近似(切入3/额定12/切出25 m/s); "
+               "云量反向→光照潜力。这是『出力潜力』代理, 非调度实测出力。")
+    try:
+        _wm = pd.read_sql("SELECT 点位名称, 风速_120m, 总云量_pct, 时间 FROM weather_hourly", _conn0)
+        if not _wm.empty:
+            _wm["ym"] = pd.to_datetime(_wm["时间"], errors="coerce").dt.strftime("%Y-%m")
+            _wm = _wm[_wm["ym"] == target]
+        if not _wm.empty:
+            _wm["风速_120m"] = pd.to_numeric(_wm["风速_120m"], errors="coerce")
+            _wm["总云量_pct"] = pd.to_numeric(_wm["总云量_pct"], errors="coerce")
+            def _wi(s):
+                ws = s.mean()
+                if pd.isna(ws):
+                    return None
+                if ws >= 25:
+                    return 0.0
+                return min(100.0, max(0.0, (ws - 3.0) / (12.0 - 3.0) * 100.0))
+            _hd = _wm[_wm["点位名称"].isin(HEDONG_POINTS)]
+            _hx = _wm[_wm["点位名称"].isin(HEXI_POINTS)]
+            _wh = _wi(_hd["风速_120m"]) if not _hd.empty else None
+            _wx = _wi(_hx["风速_120m"]) if not _hx.empty else None
+            _sol = max(0.0, 100.0 - float(_wm["总云量_pct"].mean())) if _wm["总云量_pct"].notna().any() else None
+            c1, c2, c3 = st.columns(3)
+            c1.metric("河西风电潜力", f"{_wx:.0f}" if _wx is not None else "—")
+            c2.metric("河东风电潜力", f"{_wh:.0f}" if _wh is not None else "—")
+            c3.metric("光伏潜力(云量反向)", f"{_sol:.0f}" if _sol is not None else "—")
+            st.caption(f"⚠ 仅 {target} 有天气预报覆盖时显示(weather_hourly 覆盖至 2026-09-26); "
+                       "真实出力待平台恢复后接入 daily_renewable。")
+        else:
+            st.info(f"⏳ {target} 暂无天气预报覆盖, 出力潜力待接入。")
+    except Exception as _e:
+        st.caption(f"出力代理加载异常: {_e}")
+
+    # 负荷预测(待接入占位)
+    st.markdown("#### ⚡ 负荷预测（待接入）")
+    st.caption("数据源: daily_load(表结构已就绪, 待平台恢复后导入全省/河东/河西 96 点负荷)。"
+               "负荷是供需平衡核心, 接入后此处输出河东/河西月度负荷中枢 + 96 点曲线。")
+    with st.expander("📐 daily_load schema (MySQL)", expanded=False):
+        st.code("CREATE TABLE daily_load (\n  日期 DATE, 时段 TINYINT,\n  统调负荷_MW DECIMAL(12,2), 全社会负荷_MW DECIMAL(12,2),\n  PRIMARY KEY (日期, 时段)\n);", language="sql")
+    _conn0.close()
+    st.write("---")
 
     # ===== ① 总量预测 =====
     fc = seasonal_forecast(df, target_year, target_month)
@@ -2032,11 +2208,11 @@ def _build_calendar(sub, ty, tm):
 
 
 def render_review():
-    """已披露检修复盘（交易决策页）: 针对已披露月份, 把实测数据提炼成交易信号。
-    8 项: 提示卡/压力日历/甘特/高影响清单/电源结构/地区集中度/外送-检修/回测。
-    全部基于已入库数据, 不依赖台账/现货价。"""
-    st.markdown("# 📈 已披露检修复盘（交易决策页）")
-    st.caption("针对已披露月份, 将实测检修数据提炼为交易信号; 数据: 检修记录(5692条)+披露报告(35月)+交易计划(32月)")
+    """已披露复盘（事后核对页）: 针对已披露月份, 把实测数据提炼为交易信号 + 预测 vs 实际回测。
+    与『月度/周度/日前预测』三页互补: 预测页看交易前预判, 本页看交易后实际与偏差。"""
+    st.markdown("# 📈 已披露复盘（事后核对）")
+    st.caption("针对已披露月份, 将实测检修/价格数据提炼为交易信号并做预测 vs 实际回测; "
+               "数据: 检修记录+披露报告+交易计划+现货价。本页为『事后』视角, 交易前预判见上方三个预测页。")
 
     df = load_maint()
     df_disc = load_disclosure()
@@ -2237,8 +2413,9 @@ def render_review():
 
     # ---------- 4. 高影响检修清单 ----------
     st.markdown("### 📋 高影响检修清单（按检修级别 + 持续天数）")
-    st.caption("表格按(申请单位+设备)合并汇总, 每行=一组设备; '当月次数'列=该设备当月独立记录条数; "
-               "'影响区域'为该厂站所属地市; '持续天数'='结束-开始'天数(缺结束日期用检修天数)。"
+    st.caption("表格按(申请单位+设备)合并汇总, 每行=一组设备; '影响区域'为该厂站所属地市"
+               "(原始PDF无断面/变电站字段, 断面级影响需补线路台账, 暂以地市表示); "
+               "'持续天数'='结束-开始'天数(缺结束日期用检修天数)。"
                "排序: 检修级别(A>B>C>D>改造/例行…)优先, 同级再比持续天数 —— "
                "A级40天大修自然排在D级10天小修之前。多事件时间分布见上方甘特图。")
     lst = sub.copy()
@@ -2267,8 +2444,6 @@ def render_review():
     # 合并逻辑: 按(申请单位, 停电设备), 避免不同电厂同名机组被错误合并
     grp = lst.sort_values(["_sev", "持续天数", "权重"], ascending=False).drop_duplicates(
         subset=["申请单位", "停电设备"], keep="first")
-    cnt = sub.groupby(["申请单位", "停电设备"]).size().rename("当月次数")
-    grp = grp.merge(cnt, on=["申请单位", "停电设备"], how="left")
     grp = grp.drop(columns=["持续天数"], errors="ignore")
     days_max = lst.groupby(["申请单位", "停电设备"])["持续天数"].max().rename("持续天数")
     grp = grp.merge(days_max, on=["申请单位", "停电设备"], how="left")
@@ -2281,13 +2456,13 @@ def render_review():
     grp["检修时间"] = grp.apply(lambda r: fmt_range(r["开始日期_dt"], r["结束日期_dt"]), axis=1)
     grp = grp.sort_values(["_sev", "持续天数", "权重"], ascending=[False, False, False])
     show = grp[["停电设备", "申请单位", "检修时间", "所属地区",
-                "设备类型", "等级", "持续天数", "当月次数"]].copy()
+                "设备类型", "等级", "持续天数"]].copy()
     show = show.rename(columns={"停电设备": "线路/设备", "所属地区": "影响区域",
                                   "申请单位": "申请单位/厂站"})
     show["影响区域"] = show["影响区域"].replace("其他", "—")
     show["持续天数"] = show["持续天数"].apply(lambda v: f"{int(v)}天" if pd.notna(v) else "—")
     show = show[["线路/设备", "申请单位/厂站", "检修时间",
-                  "影响区域", "设备类型", "等级", "持续天数", "当月次数"]]
+                  "影响区域", "设备类型", "等级", "持续天数"]]
     st.dataframe(show, use_container_width=True, hide_index=True, height=360)
 
     # ---------- 5. 检修与电源结构（有数据才显示, 无数据静默隐藏） ----------
@@ -2314,26 +2489,7 @@ def render_review():
             st.caption("来源: 月度披露报告(分电源发电量字段)。结合本月火电检修占比, "
                        "判断电源结构对供需的影响权重。")
 
-    # ---------- 6. 检修地区集中度 ----------
-    st.markdown("### 📊 检修地区集中度")
-    rc = sub["所属地区"].replace("其他", pd.NA).dropna().value_counts()
-    if not rc.empty:
-        cr3 = rc.head(3).sum() / rc.sum()
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.metric("地区集中度 CR3", f"{cr3*100:.0f}%")
-            st.caption("**前三地区占比; >70% 表示高度集中(区域价差易拉大); <50% 表示分散。**")
-        with c2:
-            import plotly.express as px
-            fig = px.bar(x=rc.index.tolist(), y=rc.values.tolist(),
-                         color=rc.values.tolist(), color_continuous_scale="Blues",
-                         text=[f"{v}项" for v in rc.values.tolist()])
-            fig.update_traces(textposition="outside")
-            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=60),
-                              showlegend=False, yaxis_title="检修项数")
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("该月检修地区均为'其他', 无法做地区集中度分析。")
+    # ---------- 6. 检修地区集中度（已按反馈移除: 对交易员参考价值低, CR3 指标亦删）----------
 
     # ---------- 7. 供给压力评估（原: 外送-检修双重挤压） ----------
     st.markdown("### 🔀 供给压力评估（检修 × 外送）")
@@ -2435,27 +2591,44 @@ def render_review():
     st.write("---")
     st.markdown("### 🔌 断面限额（外送通道实测 · 已披露）")
     st.caption("来源: 每月披露的断面限额表(已披露实测)。正向限额 = 外送能力上限, 反向限额 = 受入能力上限; "
-               "备注含『检修』= 该通道当月被检修占用, 直接卡外送窗口——决策人看外送/受入前先盯这条。")
+               "'是否受检修影响'由备注判断(含检修描述=是; 纯数字串为PDF抽取 artifact=否)。")
     if df_sec is not None and not df_sec.empty:
         sm = df_sec[df_sec["月份"].astype(str) == target].copy()
         if not sm.empty:
+            import re
+
+            def _affected(note):
+                if note is None:
+                    return False
+                s = str(note).strip()
+                if s in ("", "无", "╱", "—", "nan", "None"):
+                    return False
+                # 纯数字/斜杠(抽取 artifact, 如 "600 600 620 620 550 600") → 非检修
+                if re.fullmatch(r"[\d\s/．._]+", s):
+                    return False
+                # 含"检修"明确是检修; 含其他中文(如"白银变750千伏Ⅱ母及7258")视为检修相关
+                return ("检修" in s) or any('\u4e00' <= ch <= '\u9fff' for ch in s)
+
             sm_disp = sm.rename(columns={"断面名称": "断面",
                                          "正向限额": "正向限额(外送)",
                                          "反向限额": "反向限额(受入)"})
-            sm_disp["备注"] = sm_disp.apply(
-                lambda r: ("⚠ " + str(r["备注"])) if ("检修" in str(r["备注"])) else r["备注"], axis=1)
+            sm_disp["是否受检修影响"] = sm_disp["备注"].apply(_affected).map({True: "是", False: "否"})
+            sm_disp["检修说明"] = sm_disp["备注"].apply(
+                lambda v: "" if (v is None or str(v).strip() in ("无", "╱", "—", "nan", "None")) else str(v))
+            sm_disp = sm_disp[["断面", "正向限额(外送)", "反向限额(受入)",
+                               "是否受检修影响", "检修说明"]]
             st.dataframe(sm_disp, use_container_width=True, hide_index=True, height=320)
-            n_aff = int(sm["备注"].astype(str).str.contains("检修", na=False).sum())
+            n_aff = int((sm_disp["是否受检修影响"] == "是").sum())
             if n_aff:
-                st.warning(f"⚠ 当月 {n_aff} 个断面限额备注含『检修』, 这些外送通道被检修占用, "
-                           f"谈外送增量前需重点核实。")
+                st.warning(f"⚠ 当月 {n_aff} 个断面限额受检修影响(见'是否受检修影响'=是), "
+                           f"这些外送通道被检修占用, 谈外送增量前需重点核实。")
             else:
-                st.success("当月断面限额备注无检修占用, 外送通道基本畅通。")
+                st.success("当月断面限额均无检修占用, 外送通道基本畅通。")
             try:
                 sm2 = sm.copy()
 
                 def _fwd(v):
-                    s = str(v).replace("无", "").replace("—", "").strip()
+                    s = str(v).replace("无", "").replace("—", "").replace("╱", "").strip()
                     if s.startswith("-") or s == "":
                         return 0.0
                     try:
@@ -2469,19 +2642,21 @@ def render_review():
                 per_sec = (sm2.groupby("断面名称")["正向(外送)"]
                            .apply(lambda s: float(s[s > 0].min()) if (s > 0).any() else 0.0)
                            .reset_index())
-                per_sec = per_sec[per_sec["正向(外送)"] > 0]
+                per_sec = per_sec[per_sec["正向(外送)"] > 0].sort_values("正向(外送)", ascending=False)
                 if not per_sec.empty:
                     import plotly.graph_objects as go
                     fig = go.Figure(go.Bar(x=per_sec["断面名称"], y=per_sec["正向(外送)"],
                                            marker_color="#185FA5",
                                            text=per_sec["正向(外送)"].astype(int),
                                            textposition="outside"))
-                    fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=60),
+                    fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=80),
                                       yaxis_title="本月最低正向限额(外送·卡脖子值)")
                     st.plotly_chart(fig, use_container_width=True)
                     st.caption("柱高=该断面当月『最低』正向限额(最紧张时段), 即外送能力的卡脖子约束, "
-                               "不把各时段限额加总; 限额越低, 该通道外送空间越小; "
-                               "0 表示该通道仅可受入(反向)。")
+                               "已按限额从高到低排序; 不把各时段限额加总。限额越低, 该通道外送空间越小; "
+                               "0 表示该通道仅可受入(反向)。"
+                               "注: 甘青断面是甘青联网主通道, 额定/可用外送能力本就高于省内及多数省间断面, "
+                               "故其'最低正向限额'(约900)也高于其它断面(多在400-700), 属正常结构, 非数据异常。")
             except Exception:
                 pass
         else:
@@ -2534,30 +2709,8 @@ def render_review():
     st.caption("本页各交易信号均基于已披露实测数据; '影响电价区间'等需现货价接入后在'当月检修明细'页补充。"
                "🌤 天气适配块(页尾)为已披露检修×天气预报扩展, 天气非实测。")
 
-    # ---------- 11. 各模块数据覆盖期(口径透明) ----------
-    st.markdown("### 📚 各模块数据覆盖期")
-    st.caption("看板各数据源的覆盖区间; 预测月超出覆盖期时, 对应面板会提示『数据不足』而非编造。")
-
-    def _cov(loader, col="月份"):
-        try:
-            d = loader()
-            if d is None or d.empty:
-                return "—"
-            ms = d[col].astype(str)
-            return f"{ms.min()} ~ {ms.max()}（{len(d)} 行）"
-        except Exception:
-            return "—"
-
-    cov_rows = [
-        ("检修记录", _cov(load_maint, "披露月份")),
-        ("月度披露报告", _cov(load_disclosure)),
-        ("月度平衡", _cov(load_bal)),
-        ("断面限额", _cov(load_section)),
-        ("月度交易计划", _cov(load_trade_plan)),
-        ("联络线分时", _cov(load_tieline)),
-    ]
-    st.dataframe(pd.DataFrame(cov_rows, columns=["数据模块", "覆盖期"]),
-                 use_container_width=True, hide_index=True)
+    # ---------- 11. 各模块数据覆盖期(已移至「📋 数据台账」页底部) ----------
+    st.caption("各模块数据覆盖期已移至「📋 数据台账」页底部, 便于核查数据源区间, 不在交易决策页占用空间。")
 
     # ---------- 12. 🌤 天气-检修适配(已披露检修 × 未来天气) ----------
     st.markdown("### 🌤 天气-检修适配（已披露检修 × 未来 10 天天气）")
@@ -2641,7 +2794,30 @@ def render_ledger():
     st.download_button("📥 导出 CSV", csv, f"检修数据_{datetime.now():%Y%m%d}.csv", "text/csv")
 
     st.write("---")
-    # 断面限额面板已移至「📈 已披露复盘」页(第 9 项), 与联络线分时并列, 仅用已披露实测。
+    # ---------- 各模块数据覆盖期(口径透明, 从复盘页移入) ----------
+    st.markdown("### 📚 各模块数据覆盖期")
+    st.caption("看板各数据源的覆盖区间; 预测月超出覆盖期时, 对应面板会提示『数据不足』而非编造。")
+
+    def _cov(loader, col="月份"):
+        try:
+            d = loader()
+            if d is None or d.empty:
+                return "—"
+            ms = d[col].astype(str)
+            return f"{ms.min()} ~ {ms.max()}（{len(d)} 行）"
+        except Exception:
+            return "—"
+
+    cov_rows = [
+        ("检修记录", _cov(load_maint, "披露月份")),
+        ("月度披露报告", _cov(load_disclosure)),
+        ("月度平衡", _cov(load_bal)),
+        ("断面限额", _cov(load_section)),
+        ("月度交易计划", _cov(load_trade_plan)),
+        ("联络线分时", _cov(load_tieline)),
+    ]
+    st.dataframe(pd.DataFrame(cov_rows, columns=["数据模块", "覆盖期"]),
+                 use_container_width=True, hide_index=True)
 
 
 # ==================== 📅 日度态势(新, 框架) ====================
@@ -2728,12 +2904,52 @@ def _build_daily_summary():
 
 
 def render_daily():
-    """日度态势页: 5 个子模块. 现货价/天气已接入, 出力/负荷/联络线日度待接入."""
+    """日前预测页(交易前): 次日价格/风光潜力/检修/天气快览 + 5 块实测参考。"""
     import pandas as _pd
-    st.markdown("# 📅 日度态势（5 数据源 · 接入中）")
-    st.caption("本页聚合 5 块日度级信号, 服务每日盘前/盘中/盘后决策。"
-               "现货价(1-8月历史)与天气(未来10天预报)已接入; 出力/负荷/联络线日度的表结构与导入脚本已就绪, 拿到数据即接。"
-               "⚠️ 现货为历史披露、天气为预报, 均非实时行情, 决策以当日实盘为准。")
+    from datetime import date as _date, timedelta as _td
+    st.markdown("# ⚡ 日前预测（交易前 · 次日）")
+    st.caption("在每日交易前给出『次日』的价格 / 出力潜力 / 检修 / 天气预判, 服务盘前申报决策。"
+               "价格与风光潜力已有数据支撑; 负荷/实测出力待平台恢复后接入。"
+               "⚠️ 现货为历史披露基线、天气为预报, 均非实时行情, 决策以当日实盘为准。")
+
+    # ---------- 交易前快览: 次日价格 + 风光潜力 + 检修 ----------
+    _conn_d = get_conn()
+    _tomorrow = _date.today() + _td(days=1)
+    st.markdown("### 🧭 次日快览（交易前）")
+    st.caption(f"默认展示 {_tomorrow.strftime('%Y-%m-%d')}（明日）预测; 可在下方『明日价格预测』选择具体日。")
+    _pf_t = price_daily_forecast(_conn_d, _tomorrow)
+    _rp_t = renewable_potential(_conn_d, _tomorrow)
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    if _pf_t and "df" in _pf_t and not _pf_t["df"].empty:
+        _da = _pf_t["df"]["p50"].mean()
+        with _c1:
+            st.metric("明日日前均价P50", f"{_da:.0f}", help="同月小时基线均值")
+        with _c2:
+            st.metric("置信区间", f"{_pf_t['df']['lo'].min():.0f}~{_pf_t['df']['hi'].max():.0f}")
+    else:
+        with _c1:
+            st.metric("明日日前均价P50", "—")
+        with _c2:
+            st.metric("置信区间", "—")
+    with _c3:
+        st.metric("河西风电潜力", f"{_rp_t['wind_hexi']:.0f}" if (_rp_t and _rp_t.get('wind_hexi') is not None) else "—")
+    with _c4:
+        st.metric("河东风电潜力", f"{_rp_t['wind_hedong']:.0f}" if (_rp_t and _rp_t.get('wind_hedong') is not None) else "—")
+
+    # 次日检修事件
+    _dfm = load_maint()
+    _sub_t = pd.DataFrame()
+    if not _dfm.empty and "开始日期_dt" in _dfm.columns and "结束日期_dt" in _dfm.columns:
+        _ts = pd.Timestamp(_tomorrow)
+        _sub_t = _dfm[(_dfm["开始日期_dt"] <= _ts) & (_dfm["结束日期_dt"] >= _ts)]
+    if not _sub_t.empty:
+        _n = len(_sub_t)
+        _ex = "、".join((_sub_t["申请单位"].astype(str) + "·" + _sub_t["停电设备"].astype(str)).head(3).tolist())
+        st.info(f"🔧 次日有 **{_n}** 项检修在进行/开工: {_ex} 等（明细见下方『检修事件』）。")
+    else:
+        st.info("🔧 次日无检修事件（或在修记录缺少起止日期）。")
+    _conn_d.close()
+    st.write("---")
 
     # ---------- 顶栏: 核心结论(数据快照合成) ----------
     _summ = _build_daily_summary()
@@ -2876,11 +3092,45 @@ def render_daily():
 
     st.divider()
 
+    # ---------- 2.5 明日价格预测(24点) ----------
+    with st.container(border=True):
+        st.markdown("#### 📈 明日价格预测（24 点 · 统一点）")
+        st.caption("数据源: daily_spot_price(统一点); 方法: 同月同时段基线 P50 ±1.28σ(P10/P90)。"
+                   "⚠ 河东/河西价差待补; 此为基础参考, 实际申报以当日实盘为准。")
+        _conn_f = get_conn()
+        _def = _date.today() + _td(days=1)
+        _fd = st.date_input("预测日期", value=_def, key="fc_day")
+        _pf = price_daily_forecast(_conn_f, _fd)
+        if _pf and "df" in _pf and not _pf["df"].empty:
+            import plotly.graph_objects as go
+            dff = _pf["df"]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=dff["h"], y=dff["hi"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=dff["h"], y=dff["lo"], mode="lines", line=dict(width=0), fill="tonexty",
+                                    fillcolor="rgba(24,95,165,0.18)", name="P10~P90", hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=dff["h"], y=dff["p50"], mode="lines+markers", name="P50(预测)",
+                                    line=dict(color="#185FA5", width=2)))
+            fig.update_layout(height=340, margin=dict(l=40, r=20, t=30, b=30),
+                              xaxis_title="时段(0-23)", yaxis_title="元/MWh", xaxis=dict(dtick=2))
+            st.plotly_chart(fig, use_container_width=True)
+            _da = dff["p50"].mean()
+            _peak_h = int(dff.loc[dff["p50"].idxmax(), "h"])
+            _val_h = int(dff.loc[dff["p50"].idxmin(), "h"])
+            st.info(f"📈 {_fd.strftime('%Y-%m-%d')} 预测日前均价 {_da:.0f} 元/MWh; 价格高点约 {_peak_h} 时、低点约 {_val_h} 时。"
+                     f"数据来源: {_pf['src']}。")
+        elif _pf and "error" in _pf:
+            st.caption(f"预测异常: {_pf['error']}")
+        else:
+            st.info("现货价数据不足。")
+        _conn_f.close()
+
+    st.divider()
+
     # ---------- 3. 现货价分时(日前 vs 实时) ----------
     with st.container(border=True):
-        st.markdown("#### 💰 现货价分时(日前 vs 实时)")
-        st.caption("数据源: daily_spot_price(已接入 2026-01~08, 5832 行, 全月全24时段, 元/MWh)。"
-                   "出清均价仅 1-4 月有(5-8 月空); 峰平谷已按小时统一补齐。日前-实时价差 → 套利/风险时段。")
+        st.markdown("#### 💰 现货价分时（历史参考）")
+        st.caption("历史参考: daily_spot_price(已接入 2026-01~08, 5832 行, 全月全24时段, 元/MWh)。"
+                   "出清均价仅 1-4 月有(5-8 月空); 峰平谷已按小时统一补齐。用于复盘已发生日前-实时价差 → 套利/风险时段。")
         with st.expander("📐 实际数据 schema (MySQL)", expanded=False):
             st.code(
                 "CREATE TABLE daily_spot_price (\n"
@@ -3098,14 +3348,111 @@ def render_daily():
     )
 
 
+# ==================== 周度预测页（交易前） ====================
+def render_weekly():
+    """周度预测页(交易前): 未来 7 天 价格 / 风光出力潜力 / 检修 / 天气预警。"""
+    from datetime import date as _date, timedelta as _td
+    st.markdown("# 📆 周度预测（交易前 · 未来 7 天）")
+    st.caption("在交易前给出未来一周的负荷 / 检修 / 出力 / 价格预判; 价格与风光出力已有数据支撑, "
+               "负荷待接入。⚠ 现货为历史披露基线、天气为预报, 均非实时行情, 决策以当日实盘为准。")
+    _conn = get_conn()
+    today = _date.today()
+    start = st.date_input("起始日（默认今天）", value=today, label_visibility="collapsed")
+    days = [start + _td(days=i) for i in range(7)]
+    end = days[-1]
+
+    # ---- 顶部: 未来 7 天逐日速览表 ----
+    st.markdown("### 📋 未来 7 天逐日速览")
+    st.caption("价格=统一点日前价(同月基线); 出力=天气代理(非实测)。负荷待接入, 暂不列。")
+    rows = []
+    for d in days:
+        pf = price_daily_forecast(_conn, d)
+        rp = renewable_potential(_conn, d)
+        if pf and "df" in pf and not pf["df"].empty:
+            da_avg = pf["df"]["p50"].mean(); lo = pf["df"]["lo"].min(); hi = pf["df"]["hi"].max()
+        else:
+            da_avg = lo = hi = None
+        rows.append({
+            "日期": d.strftime("%m-%d"),
+            "日前均价P50": f"{da_avg:.0f}" if da_avg is not None else "—",
+            "置信区间": f"{lo:.0f}~{hi:.0f}" if lo is not None else "—",
+            "河西风电潜力": f"{rp['wind_hexi']:.0f}" if (rp and rp.get('wind_hexi') is not None) else "—",
+            "河东风电潜力": f"{rp['wind_hedong']:.0f}" if (rp and rp.get('wind_hedong') is not None) else "—",
+            "光伏潜力": f"{rp['solar']:.0f}" if (rp and rp.get('solar') is not None) else "—",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ---- 周度价格 24 点预测(起始月同月基线代表) ----
+    st.markdown("### 💰 周度日前价 24 点预测（起始月同月基线）")
+    pf0 = price_daily_forecast(_conn, start)
+    if pf0 and "df" in pf0 and not pf0["df"].empty:
+        import plotly.graph_objects as go
+        dfp = pf0["df"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["hi"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["lo"], mode="lines", line=dict(width=0), fill="tonexty",
+                                fillcolor="rgba(24,95,165,0.18)", name="P10~P90", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["p50"], mode="lines+markers", name="P50(预测)",
+                                line=dict(color="#185FA5", width=2)))
+        fig.update_layout(height=320, margin=dict(l=40, r=20, t=30, b=30),
+                          xaxis_title="时段(0-23)", yaxis_title="元/MWh", xaxis=dict(dtick=2))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"数据源: {pf0['src']}; 周度用起始月同月小时基线代表(各日差异主要体现在风光出力, 见上表)。"
+                   "⚠ 统一点价; 河东/河西价差待补。")
+    else:
+        st.info("现货价数据不足, 无法生成周度价格预测。")
+
+    # ---- 未来 7 天检修事件 ----
+    st.markdown("### 🔧 未来 7 天检修事件")
+    df = load_maint()
+    if not df.empty and "开始日期_dt" in df.columns and "结束日期_dt" in df.columns:
+        sub = df[(df["开始日期_dt"] <= pd.Timestamp(end)) & (df["结束日期_dt"] >= pd.Timestamp(start))]
+        if not sub.empty:
+            _cols = [c for c in ["申请单位", "停电设备", "检修级别", "开始日期", "结束日期", "所属地区", "设备类型"]
+                     if c in sub.columns]
+            _sh = sub[_cols].copy()
+            _sh["开始日期"] = _sh["开始日期"].astype(str)
+            _sh["结束日期"] = _sh["结束日期"].astype(str)
+            _sh = _sh.rename(columns={"停电设备": "设备", "申请单位": "厂站", "所属地区": "区域"})
+            st.dataframe(_sh, use_container_width=True, hide_index=True, height=300)
+            st.caption(f"共 {len(_sh)} 项检修在所选 7 天窗口内开工或持续; 完整月度检修预测见『月度预测』页。")
+        else:
+            st.info("所选 7 天窗口内无检修事件(或在修记录缺少起止日期)。")
+    else:
+        st.info("检修数据不足。")
+
+    # ---- 未来 7 天天气预警 ----
+    st.markdown("### ⚠ 未来 7 天天气预警（检修作业 / 风电）")
+    try:
+        _dfw = pd.read_sql("SELECT `时间`,`点位名称`,`风速_10m`,`降水_mm`,`雷暴` FROM weather_hourly "
+                           "WHERE `时间`>=%s AND `时间`<=%s ORDER BY `时间`", _conn,
+                           params=(pd.Timestamp(start), pd.Timestamp(end) + _td(hours=23)))
+        if not _dfw.empty:
+            _dfw["时间"] = pd.to_datetime(_dfw["时间"])
+            _dfw["触发"] = (_dfw["风速_10m"] > 10.7) | (_dfw["雷暴"] == 1) | (_dfw["降水_mm"] > 0.5)
+            _h = _dfw[_dfw["触发"]]
+            if not _h.empty:
+                st.warning(f"⚠ 未来 7 天共 {len(_h)} 条天气风险记录(大风/雷暴/强降水), 可能影响户外检修与风电出力。")
+            else:
+                st.success("✅ 未来 7 天天气窗口良好, 无受限预警。")
+        else:
+            st.info("所选窗口无天气预报数据(weather_hourly 覆盖至 2026-09-26)。")
+    except Exception as _e:
+        st.caption(f"天气加载异常: {_e}")
+    _conn.close()
+
+
 # ==================== 入口 ====================
-TAB = st.sidebar.radio("导航", ["📊 预测报告", "📈 已披露复盘", "📋 数据台账", "📅 日度态势(新)"], label_visibility="visible")
-if TAB == "📊 预测报告":
+TAB = st.sidebar.radio("导航", ["📅 月度预测", "📆 周度预测", "⚡ 日前预测", "📈 已披露复盘", "📋 数据台账"],
+                        label_visibility="visible")
+if TAB == "📅 月度预测":
     render_report()
+elif TAB == "📆 周度预测":
+    render_weekly()
+elif TAB == "⚡ 日前预测":
+    render_daily()
 elif TAB == "📈 已披露复盘":
     render_review()
-elif TAB == "📅 日度态势(新)":
-    render_daily()
 else:
     render_ledger()
 
