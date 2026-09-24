@@ -1149,10 +1149,99 @@ def _pf_hours():
     valley = [10, 11, 12, 13, 14, 15]
     return peak, flat, valley
 
+import numpy as np  # 电价预测v2: renew_idx 用到 nan/isnan
+
+# ============ 电价预测 v2: 多因子(风光+检修已纳入, 其余待补) ============
+# 经验系数(2026-09-23 基于 history_weather_hourly 全量1-9月 + daily_spot_price 对齐257天, 去季节化回归)
+#   price_anom = B_RENEW * renew_anom ; 风光指数每升0.1 → 价格降≈20.8 元/MWh
+B_RENEW = -207.9
+RENEW_ANOM_STD = 0.076
+CLIM_RENEW = {1:0.337,2:0.392,3:0.458,4:0.490,5:0.505,6:0.475,7:0.469,8:0.455,9:0.428,10:0.377,11:0.359,12:0.322}
+HEXIN_STATIONS = ["酒泉", "嘉峪关", "张掖", "武威"]
+
+def _wind_cf(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return np.nan
+    v = min(max(float(v), 0), 25)
+    if v < 3:
+        return 0.0
+    if v >= 12:
+        return 1.0
+    return (v**3 - 27.0) / (1728.0 - 27.0)
+
+def _solar_cf_ghi(g):
+    if g is None or (isinstance(g, float) and np.isnan(g)):
+        return np.nan
+    return min(max(float(g) / 800.0, 0), 1)
+
+def _solar_cf_cloud(cloud):
+    if cloud is None or (isinstance(cloud, float) and np.isnan(cloud)):
+        return np.nan
+    return min(max((100.0 - float(cloud)) / 100.0, 0), 1)
+
+def renew_idx_from_weather(wdf):
+    """从天气 DataFrame 算综合风光指数(0-1); 兼容 history(风速_100m+GHI) 与 weather(风速_120m+云量)。"""
+    if wdf is None or wdf.empty:
+        return np.nan
+    if "风速_100m" in wdf.columns:
+        wcol = "风速_100m"
+    elif "风速_120m" in wdf.columns:
+        wcol = "风速_120m"
+    else:
+        wcol = None
+    if wcol:
+        hexin = wdf[wdf["点位名称"].isin(HEXIN_STATIONS)]
+        wind = hexin[wcol].apply(_wind_cf).mean() if not hexin.empty else wdf[wcol].apply(_wind_cf).mean()
+    else:
+        wind = np.nan
+    if "短波辐射_Whm2" in wdf.columns:
+        pcf_mean = float(wdf["短波辐射_Whm2"].apply(_solar_cf_ghi).mean())
+    elif "总云量_pct" in wdf.columns:
+        pcf_mean = float(wdf["总云量_pct"].apply(_solar_cf_cloud).mean())
+    else:
+        pcf_mean = np.nan
+    if pd.isna(wind) and pd.isna(pcf_mean):
+        return np.nan
+    if pd.isna(wind):
+        return pcf_mean
+    if pd.isna(pcf_mean):
+        return float(wind)
+    return float(0.6 * wind + 0.4 * pcf_mean)
+
+def _forecast_renew_idx(conn, target_date):
+    """从 weather_hourly 取目标日天气, 算综合风光指数(0-1), 用于日度价格预测的风光修正。无数据返回 nan。"""
+    try:
+        w = pd.read_sql("SELECT 点位名称, 风速_120m, 总云量_pct FROM weather_hourly WHERE DATE(时间)=%s",
+                        conn, params=(target_date.strftime("%Y-%m-%d"),))
+        if w.empty:
+            return np.nan
+        return renew_idx_from_weather(w)
+    except Exception:
+        return np.nan
+
+def _maint_supply_adj(conn, ty, tm):
+    """检修供给收缩修正(估算): 当月火/水电 A/B 级检修→电价小幅上调。甘肃价格由风光主导, 检修影响小, 上限+10%。"""
+    try:
+        df = pd.read_sql("SELECT 申请单位, 检修级别, 开始日期 FROM 检修记录", conn)
+        if df.empty:
+            return 0.0
+        df["开始"] = pd.to_datetime(df["开始日期"], errors="coerce")
+        df["mo"] = df["开始"].dt.month
+        sub = df[df["mo"] == tm]
+        if sub.empty:
+            return 0.0
+        kw = ["发电", "火电", "水电", "电厂", "能源"]
+        maint = sub[sub["申请单位"].astype(str).str.contains("|".join(kw), na=False)]
+        lv = {"A级检修": 2.0, "B级检修": 1.0}
+        score = maint["检修级别"].map(lv).fillna(0.0).sum()
+        return min(0.10, score * 0.015)
+    except Exception:
+        return 0.0
+
 def price_monthly_forecast(conn, ty, tm):
-    """月度统一点日前价预测: P50=同月历史均值; 区间=±1.28×同月小时std(正态近似)。
-    返回峰/平/谷均价(同一月内按时段聚合)。无同月历史时回退全样本基线。
-    注: 全量取出后在 pandas 过滤, 兼容 MySQL 与 SQLite(发布版)。"""
+    """月度统一点日前价预测 v2: 基线(季节邻近) + 风光修正 + 检修修正 → 三情景(强/基准/弱风光)。
+    价格由多因子共同决定(风光/负荷/检修/外送/断面/煤价), 当前仅风光(历史关系)+检修(估算)已纳入,
+    其余因子在 factors 清单透明标注待补。全量取出后 pandas 计算, 兼容 MySQL/SQLite(发布版)。"""
     try:
         d = pd.read_sql("SELECT 日期, 时段 h, 日前价_元MWh da FROM daily_spot_price", conn)
         if d.empty:
@@ -1160,26 +1249,42 @@ def price_monthly_forecast(conn, ty, tm):
         d["月"] = pd.to_datetime(d["日期"], errors="coerce").dt.month
         dm = d[d["月"] == tm]
         if dm.empty:
-            src = "全样本基线(无同月历史)"; dd = d
+            nb = [(tm - 1) or 12, (12 if tm == 12 else tm + 1)]
+            dm = d[d["月"].isin(nb)]
+            src = "季节邻近月(%02d/%02d)基线" % (nb[0], nb[1])
         else:
-            src = f"同月历史(MONTH={tm:02d})"; dd = dm
-        p50 = float(dd["da"].mean())
-        sd = float(dd["da"].std()) if len(dd) > 1 else 0.0
-        lo = max(40.0, p50 - 1.28 * sd)
-        hi = p50 + 1.28 * sd
+            src = "%d年%02d月同月历史" % (ty, tm)
+        if dm.empty:
+            return None
+        p50 = float(dm["da"].mean())
         peak, flat, valley = _pf_hours()
         def _a(hs):
-            v = dd[dd["h"].isin(hs)]["da"]
+            v = dm[dm["h"].isin(hs)]["da"]
             return float(v.mean()) if len(v) else None
-        return {"p50": p50, "lo": lo, "hi": hi, "n": len(dd), "src": src,
-                "peak": _a(peak), "flat": _a(flat), "valley": _a(valley)}
+        maint_adj = _maint_supply_adj(conn, ty, tm)
+        base = p50 * (1.0 + maint_adj)
+        # 风光修正: 月度用气候态→偏差来自天气波动, 用±1σ给区间(强风光更低/弱风光更高)
+        wind_up = B_RENEW * RENEW_ANOM_STD
+        wind_dn = -B_RENEW * RENEW_ANOM_STD
+        factors = [
+            ("风光出力", "✅ 已纳入(历史天气→价格关系 b=%.0f)" % B_RENEW),
+            ("检修供给", "✅ 已纳入(估算 +%.1f%%)" % (maint_adj * 100)),
+            ("负荷", "⏳ 待补(交易平台恢复后导入)"),
+            ("外送计划", "⏳ 待补"),
+            ("断面阻塞", "⏳ 待补(需节点价/潮流)"),
+            ("煤价", "⏳ 待补"),
+        ]
+        return {"p50": base, "lo": max(40.0, base + wind_up), "hi": base + wind_dn,
+                "peak": (None if _a(peak) is None else _a(peak) * (1 + maint_adj)),
+                "flat": (None if _a(flat) is None else _a(flat) * (1 + maint_adj)),
+                "valley": (None if _a(valley) is None else _a(valley) * (1 + maint_adj)),
+                "src": src, "factors": factors, "maint_adj": maint_adj, "wind_up": wind_up}
     except Exception as _e:
         return {"error": str(_e)}
 
-def price_daily_forecast(conn, target_date):
-    """次日/指定日 24 点日前价预测: 用同月同时段基线(均值±1.28σ, σ取日间波动)。
-    无同月历史时回退全样本小时基线。返回 DataFrame(h,p50,lo,hi) 与数据来源说明。
-    注: 全量取出后在 pandas 计算均值/标准差, 兼容 MySQL 与 SQLite(发布版, 避免 STD() 方言)。"""
+def price_daily_forecast(conn, target_date, forecast_renew=None):
+    """次日24点日前价预测 v2: 同月同时段基线 + 风光修正(按预报renew_idx) + 检修修正 → 三情景。
+    forecast_renew=None 时用气候态(基准情景)。全量取出后 pandas 计算, 兼容 MySQL/SQLite。"""
     mo = target_date.month
     try:
         d = pd.read_sql("SELECT 日期, 时段 h, 日前价_元MWh da FROM daily_spot_price", conn)
@@ -1190,18 +1295,28 @@ def price_daily_forecast(conn, target_date):
         if dm.empty:
             src = "全样本基线(无同月历史)"; dd = d
         else:
-            src = f"{mo}月同月历史"; dd = dm
+            src = "%d月同月历史" % mo; dd = dm
+        g = dd.groupby("h")["da"].agg(["mean", "std"]).reset_index()
+        maint_adj = _maint_supply_adj(conn, target_date.year, mo)
+        clim = CLIM_RENEW.get(mo, 0.45)
+        anom = 0.0 if (forecast_renew is None or (isinstance(forecast_renew, float) and np.isnan(forecast_renew))) else (forecast_renew - clim)
+        wind_corr = B_RENEW * anom
         rows = []
-        for h in range(24):
-            sub = dd[dd["h"] == h]["da"]
-            if len(sub):
-                mu = float(sub.mean())
-                sd = float(sub.std()) if len(sub) > 1 else 0.0
-            else:
-                mu = float(dd["da"].mean())
-                sd = float(dd["da"].std())
-            rows.append({"h": h, "p50": mu, "lo": max(40.0, mu - 1.28 * sd), "hi": mu + 1.28 * sd})
-        return {"df": pd.DataFrame(rows), "src": src}
+        for _, r in g.iterrows():
+            mu = float(r["mean"]) * (1.0 + maint_adj) + wind_corr
+            sd = float(r["std"]) if pd.notna(r["std"]) else 0.0
+            rows.append({"h": int(r["h"]), "p50": mu,
+                         "lo": max(40.0, mu - 1.28 * sd + B_RENEW * RENEW_ANOM_STD),
+                         "hi": mu + 1.28 * sd - B_RENEW * RENEW_ANOM_STD})
+        factors = [
+            ("风光出力", "✅ 已纳入(历史关系修正 %+.0f)" % wind_corr),
+            ("检修供给", "✅ 已纳入(估算 +%.1f%%)" % (maint_adj * 100)),
+            ("负荷", "⏳ 待补"),
+            ("外送计划", "⏳ 待补"),
+            ("断面阻塞", "⏳ 待补"),
+            ("煤价", "⏳ 待补"),
+        ]
+        return {"df": pd.DataFrame(rows), "src": src, "wind_corr": wind_corr, "factors": factors}
     except Exception as _e:
         return {"error": str(_e)}
 
@@ -1234,10 +1349,10 @@ def renewable_potential(conn, target_date):
         return {"error": str(_e)}
 
 def render_price_forecast_card(conn, ty, tm):
-    """月度预测页用的『价格预测』卡片块(统一点; 河东/河西价差标红待补)。"""
-    st.markdown("#### 💰 价格预测（统一点 · 日前价）")
-    st.caption("数据源: daily_spot_price(已接入, 统一点)。方法: 同月历史均值作 P50, "
-               "±1.28×同月小时标准差作 P10/P90 置信区间(正态近似); 峰平谷按时段聚合。")
+    """月度预测页用的『价格预测』卡片块(统一点; 多因子 v2: 风光+检修已纳入, 其余待补)。"""
+    st.markdown("#### 💰 价格预测（统一点 · 日前价 · 多因子 v2）")
+    st.caption("价格由多因子共同决定(风光/负荷/检修/外送/断面/煤价), 非单看历史电价。当前已纳入: "
+               "①风光出力(历史天气→价格关系, 大风强光→低价) ②检修供给(估算); 其余因子待补(透明标注)。")
     pf = price_monthly_forecast(conn, ty, tm)
     if pf is None:
         st.info("现货价数据不足, 暂无法预测。")
@@ -1245,17 +1360,265 @@ def render_price_forecast_card(conn, ty, tm):
     if "error" in pf:
         st.caption(f"价格预测异常: {pf['error']}")
         return
+    # 三情景: 基准 / 强风光(更低) / 弱风光(更高)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("月度均价 P50", f"{pf['p50']:.0f}", help="同月历史日前价均值")
+        st.metric("基准情景 P50", f"{pf['p50']:.0f}")
     with c2:
-        st.metric("置信区间", f"{pf['lo']:.0f}~{pf['hi']:.0f}", help="P10~P90 (±1.28σ)")
+        st.metric("强风光情景", f"{pf['lo']:.0f}", help="河西风电大发/光伏大发 → 电价下探(下限)")
     with c3:
-        st.metric("峰段均价", f"{pf['peak']:.0f}" if pf['peak'] else "—")
+        st.metric("弱风光情景", f"{pf['hi']:.0f}", help="小风弱光/负荷走高 → 电价上行(上限)")
     with c4:
-        st.metric("谷段均价", f"{pf['valley']:.0f}" if pf['valley'] else "—")
-    st.caption(f"数据来源: {pf['src']} (样本 {pf['n']} 小时)。"
-               "⚠ 当前仅统一点价; 河东/河西价差(第一信号)待运营报告节点价接入后补全(规划书已标红)。")
+        st.metric("峰/谷段", f"{pf['peak']:.0f}/{pf['valley']:.0f}" if pf['peak'] else "—/—",
+                  help="峰段(07-09,18-23) / 谷段(10-16,光伏大发)")
+    # 因子透明清单
+    fdf = pd.DataFrame(pf["factors"], columns=["影响因子", "状态"])
+    st.dataframe(fdf, use_container_width=True, hide_index=True, height=148)
+    st.caption(f"数据来源: {pf['src']}。⚠ 当前仅统一点价; 河东/河西价差(第一信号)待运营报告节点价接入后补全。")
+
+# ============ 因子驱动电价模型 v3 (价格=结果, 因子=原因) ============
+# 流程: ①预测驱动因子(负荷/风光/检修/断面/外送) ②因子→电价关联(LMP=能量价+阻塞分量+网损≈0)
+#       ③基线模型(保留作对标, 不丢弃) ④回测(MAE/MAPE 按峰/平/谷、河东/河西)
+# 数据状态(诚实标注): 统一点价✅ / 风光天气代理✅(非实测) / 检修✅ / 负荷⏳ / 断面潮流⏳ / 外送日度🟡月 / 河东河西节点价⏳(运营报告待导入)
+# 甘肃现货特性: 同样负荷/风光, 断面阻塞不同→电价完全不同; 阻塞是核心变量(河西新能源富裕+外送卡→河西砸低/河东贵→价差拉大)。
+CONG_K_HX = 60.0   # 河西阻塞价格惩罚上限(元/MWh) — 结构性模型参数, 待节点价历史校准
+CONG_K_HD = 40.0   # 河东阻塞溢价上限(元/MWh) — 待校准
+CONG_LO = 0.45     # 河西新能源指数超过此值开始挤压外送(气候态附近)
+CONG_HI = 0.65     # 阻塞饱和点
+
+def driver_status(conn):
+    """5 大驱动因子数据接入状态板(诚实标注 已接入/代理/待补)。"""
+    def _cnt(t):
+        try:
+            return int(pd.read_sql(f"SELECT COUNT(*) n FROM `{t}`", conn).iloc[0]['n'])
+        except Exception:
+            return 0
+    ren_n = _cnt('daily_renewable'); load_n = _cnt('daily_load')
+    tie_n = _cnt('daily_tie_line'); sec_n = _cnt('断面限额')
+    rows = [
+        ("负荷", "daily_load", "日度96点 MW", f"{'✅ 已接入' if load_n else '⏳ 待接入(交易平台恢复后导入)'}", "日/周/月"),
+        ("风光出力", "daily_renewable / weather_hourly", "MW / 天气代理", f"{'✅ 实测已接入' if ren_n else '🟡 天气代理(非实测出力)'}", "日/周/月"),
+        ("检修", "检修记录", "A/B级", "✅ 已接入(披露)", "日/周/月"),
+        ("断面阻塞", "断面限额 / 节点潮流", "MW / 阻塞", f"{'✅ 限额已接入' if sec_n else '⏳ 潮流待接入(节点价)'}", "日(日前)/周/月"),
+        ("外送", "daily_tie_line / 联络线分时", "MW", f"{'✅ 日度已接入' if tie_n else '🟡 月度典型(非实时)'}", "日/周/月"),
+    ]
+    return pd.DataFrame(rows, columns=["驱动因子", "数据源", "粒度/字段", "状态", "预测颗粒度"])
+
+def _congestion(hexin_renew_idx):
+    """河西→河东阻塞分量: 河西新能源越富余且外送越卡, 河西价越砸低、河东越贵, 价差拉大。返回(cong_hd, cong_hx)(元/MWh)。"""
+    if hexin_renew_idx is None or (isinstance(hexin_renew_idx, float) and np.isnan(hexin_renew_idx)):
+        return 0.0, 0.0
+    surplus = max(0.0, float(hexin_renew_idx) - CONG_LO)
+    intensity = min(1.0, surplus / (CONG_HI - CONG_LO))
+    return CONG_K_HD * intensity, -CONG_K_HX * intensity
+
+def _energy_hourly(conn, mo, ty):
+    """系统能量价(小时级): 统一点统计基线×(1+检修修正)+风光修正(已纳入); 负荷/外送修正待数据。返回 (g, maint_adj, src)。"""
+    d = pd.read_sql("SELECT 日期, 时段 h, 日前价_元MWh da FROM daily_spot_price", conn)
+    if d.empty:
+        return None
+    d["月"] = pd.to_datetime(d["日期"]).dt.month
+    dm = d[d["月"] == mo]
+    dd = dm if not dm.empty else d
+    g = dd.groupby("h")["da"].agg(["mean", "std"]).reset_index()
+    maint_adj = _maint_supply_adj(conn, ty, mo)
+    src = None if dm.empty else f"{ty}年{mo:02d}月同月历史"
+    return g, maint_adj, src
+
+def _safe(v):
+    return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+
+def price_factor_monthly(conn, ty, tm):
+    """因子驱动月度电价: 输出 河东/河西 LMP 的 P50、峰/平/谷均价、置信区间, 及与基线(统一点)对标。"""
+    try:
+        res = _energy_hourly(conn, tm, ty)
+        if res is None:
+            return None
+        g, maint_adj, src = res
+        hexin_ren = CLIM_RENEW.get(tm, 0.45)
+        wind_corr = B_RENEW * (hexin_ren - CLIM_RENEW.get(tm, 0.45))  # 月度用气候态→异常=0
+        cong_hd, cong_hx = _congestion(hexin_ren)
+        peak, flat, valley = _pf_hours()
+        energy = g["mean"] * (1 + maint_adj) + wind_corr
+        sd = g["std"].fillna(0.0)
+        out = {}
+        for name, cong in [("hedong", cong_hd), ("hexi", cong_hx)]:
+            col = energy + cong
+            out[name] = {
+                "p50": float(col.mean()),
+                "peak": _safe(col[g["h"].isin(peak)].mean()),
+                "flat": _safe(col[g["h"].isin(flat)].mean()),
+                "valley": _safe(col[g["h"].isin(valley)].mean()),
+                "lo": float((col - 1.28 * sd).min()),
+                "hi": float((col + 1.28 * sd).max()),
+            }
+        baseline = {
+            "p50": float(energy.mean()),
+            "peak": _safe(energy[g["h"].isin(peak)].mean()),
+            "flat": _safe(energy[g["h"].isin(flat)].mean()),
+            "valley": _safe(energy[g["h"].isin(valley)].mean()),
+        }
+        spread = {"p50": out["hedong"]["p50"] - out["hexi"]["p50"],
+                  "peak": (out["hedong"]["peak"] or 0) - (out["hexi"]["peak"] or 0),
+                  "valley": (out["hedong"]["valley"] or 0) - (out["hexi"]["valley"] or 0)}
+        factors = [
+            ("负荷", "⏳ 待补(交易平台恢复后导入日度96点)"),
+            ("风光出力", "✅ 已纳入(天气代理→能量价修正; 河西富裕度→阻塞分量)"),
+            ("检修供给", "✅ 已纳入(估算 +%.1f%%)" % (maint_adj * 100)),
+            ("断面阻塞", "🟡 结构性模型(河西新能源超 %.2f→河西价砸低/河东溢价; K待节点价校准)" % CONG_LO),
+            ("外送计划", "⏳ 待补(日度外送曲线)"),
+        ]
+        return {"hedong": out["hedong"], "hexi": out["hexi"], "baseline": baseline, "spread": spread,
+                "src": src or "全样本基线(无同月历史)", "factors": factors,
+                "cong": (cong_hd, cong_hx), "hexin_ren": hexin_ren}
+    except Exception as _e:
+        return {"error": str(_e)}
+
+def price_factor_daily(conn, target):
+    """因子驱动日度电价: 24点 河东LMP/河西LMP(能量价+阻塞分量) + 统一点基线对标。"""
+    try:
+        res = _energy_hourly(conn, target.month, target.year)
+        if res is None:
+            return None
+        g, maint_adj, src = res
+        hexin_ren = _forecast_renew_idx(conn, target)
+        hr = _safe(hexin_ren)
+        wind_corr = B_RENEW * (0.0 if hr is None else (hexin_ren - CLIM_RENEW.get(target.month, 0.45)))
+        cong_hd, cong_hx = _congestion(hexin_ren)
+        energy = g["mean"] * (1 + maint_adj) + wind_corr
+        sd = g["std"].fillna(0.0)
+        df = pd.DataFrame({
+            "h": g["h"].astype(int),
+            "energy": energy,
+            "hedong": energy + cong_hd,
+            "hexi": energy + cong_hx,
+            "baseline": energy,
+            "lo_hd": (energy + cong_hd - 1.28 * sd),
+            "hi_hd": (energy + cong_hd + 1.28 * sd),
+        })
+        factors = [
+            ("负荷", "⏳ 待补"),
+            ("风光出力", "✅ 已纳入(预报 renew=%.2f → 能量价修正 %+.0f; 阻塞分量)" % (hr or 0.0, wind_corr)),
+            ("检修供给", "✅ 已纳入(估算 +%.1f%%)" % (maint_adj * 100)),
+            ("断面阻塞", "🟡 结构性模型(河西新能源超阈值→河西砸低/河东溢价)"),
+            ("外送计划", "⏳ 待补"),
+        ]
+        return {"df": df, "src": src or "全样本基线(无同月历史)", "factors": factors,
+                "cong": (cong_hd, cong_hx), "hexin_ren": hr,
+                "spread_mean": float((energy + cong_hd - (energy + cong_hx)).mean())}
+    except Exception as _e:
+        return {"error": str(_e)}
+
+def backtest_price(conn):
+    """回测: 统一点基线 MAE/MAPE, 按 峰/平/谷/全 分别算(样本内, 作对标基准)。河东/河西回测待节点价历史导入。"""
+    try:
+        d = pd.read_sql("SELECT 日期, 时段 h, 日前价_元MWh da FROM daily_spot_price", conn)
+        if d.empty:
+            return None
+        d["月"] = pd.to_datetime(d["日期"]).dt.month
+        peak, flat, valley = _pf_hours()
+        recs = []
+        for lbl, hs in [("峰", peak), ("平", flat), ("谷", valley), ("全", list(range(24)))]:
+            sub = d[d["h"].isin(hs)]
+            if sub.empty:
+                continue
+            mae = 0.0
+            mape = 0.0
+            n = 0
+            for _, grp in sub.groupby("月"):
+                pred = grp["da"].mean()
+                err = (grp["da"] - pred)
+                mae += err.abs().sum()
+                mape += (err.abs() / grp["da"]).sum() * 100
+                n += len(grp)
+            recs.append((lbl, mae / max(n, 1), mape / max(n, 1)))
+        return recs
+    except Exception as _e:
+        return {"error": str(_e)}
+
+def render_factor_price_monthly(conn, ty, tm):
+    """月度预测页: 因子驱动电价卡片(河东/河西 LMP + 基线对标 + 回测)。"""
+    st.markdown("#### 🧩 因子驱动电价模型 v3（河东 / 河西 LMP · 统一点基线对标）")
+    st.caption("价格=结果, 因子=原因。架构: ①预测驱动因子(负荷/风光/检修/断面/外送) ②因子→电价关联 "
+               "LMP=能量价(全省统一,因子驱动)+阻塞分量(区域特异)+网损≈0 ③基线模型(对标,保留) ④回测(峰/平/谷、河东/河西)。")
+    st.markdown("**① 驱动因子数据接入状态**")
+    st.dataframe(driver_status(conn), use_container_width=True, hide_index=True, height=132)
+    pf = price_factor_monthly(conn, ty, tm)
+    if pf is None:
+        st.info("现货价数据不足, 暂无法建模。")
+        return
+    if "error" in pf:
+        st.caption(f"模型异常: {pf['error']}")
+        return
+    st.markdown("**② 河东 / 河西 LMP 预测（多因子）**")
+    hd, hx, bl, sp = pf["hedong"], pf["hexi"], pf["baseline"], pf["spread"]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("河东 LMP P50", f"{hd['p50']:.0f}", help="能量价 + 河东阻塞溢价")
+    with c2:
+        st.metric("河西 LMP P50", f"{hx['p50']:.0f}", help="能量价 + 河西阻塞惩罚(可能更低)")
+    with c3:
+        st.metric("价差(河东−河西)", f"{sp['p50']:.0f}", help="阻塞核心信号: 断面越卡价差越大")
+    with c4:
+        st.metric("统一点基线 P50", f"{bl['p50']:.0f}", help="保留作对标基准(不丢弃)")
+    def _fmt(v):
+        return "—" if v is None else round(float(v), 0)
+    cmp = pd.DataFrame({
+        "维度": ["P50", "峰段", "平段", "谷段"],
+        "河东LMP": [_fmt(hd['p50']), _fmt(hd['peak']), _fmt(hd['flat']), _fmt(hd['valley'])],
+        "河西LMP": [_fmt(hx['p50']), _fmt(hx['peak']), _fmt(hx['flat']), _fmt(hx['valley'])],
+        "价差": [_fmt(sp['p50']), _fmt(sp['peak']), _fmt(sp['flat']), _fmt(sp['valley'])],
+        "统一点基线": [_fmt(bl['p50']), _fmt(bl['peak']), _fmt(bl['flat']), _fmt(bl['valley'])],
+    })
+    st.dataframe(cmp, use_container_width=True, hide_index=True)
+    st.caption(f"数据来源: {pf['src']}; 阻塞分量 cong_hd={pf['cong'][0]:+.0f}/cong_hx={pf['cong'][1]:+.0f} 元/MWh "
+               f"(河西新能源指数={pf['hexin_ren']:.2f}); K 系数待节点价历史校准。⚠ 河东/河西节点价历史待运营报告导入, 当前能量价锚统一点基线。")
+    st.markdown("**③ 因子‑电价关联（透明清单）**")
+    st.dataframe(pd.DataFrame(pf["factors"], columns=["影响因子", "状态"]), use_container_width=True, hide_index=True, height=120)
+    st.markdown("**④ 回测（基线 MAE/MAPE，按峰/平/谷）**")
+    bt = backtest_price(conn)
+    if bt and not isinstance(bt, dict):
+        st.dataframe(pd.DataFrame(bt, columns=["时段类型", "MAE(元/MWh)", "MAPE(%)"]).round(1),
+                     use_container_width=True, hide_index=True)
+        st.caption("↑ 统一点基线样本内 MAE/MAPE(作对标基准)。河东/河西分区回测 + 真正外推回测待节点价历史+真实因子导入后激活。")
+    elif bt and "error" in bt:
+        st.caption(f"回测异常: {bt['error']}")
+
+def render_factor_price_daily(conn, target):
+    """日前预测页: 因子驱动电价卡片(河东/河西 LMP 24点 + 基线对标)。"""
+    st.markdown("#### 🧩 因子驱动电价（日前 · 河东 / 河西 LMP 24 点）")
+    st.caption("LMP=能量价(因子驱动)+阻塞分量。红=河东LMP(可能更高), 绿=河西LMP(可能砸低), 灰带=统一点基线P10~P90。")
+    pf = price_factor_daily(conn, target)
+    if pf is None:
+        st.info("现货价数据不足。")
+        return
+    if "error" in pf:
+        st.caption(f"模型异常: {pf['error']}")
+        return
+    df = pf["df"]
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["h"], y=df["hi_hd"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=df["h"], y=df["lo_hd"], mode="lines", line=dict(width=0), fill="tonexty",
+                            fillcolor="rgba(150,150,150,0.18)", name="统一点基线P10~P90", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=df["h"], y=df["hedong"], mode="lines+markers", name="河东LMP", line=dict(color="#C0392B", width=2)))
+    fig.add_trace(go.Scatter(x=df["h"], y=df["hexi"], mode="lines+markers", name="河西LMP", line=dict(color="#27AE60", width=2)))
+    fig.update_layout(height=360, margin=dict(l=40, r=20, t=30, b=30),
+                      xaxis_title="时段(0-23)", yaxis_title="元/MWh", xaxis=dict(dtick=2))
+    st.plotly_chart(fig, use_container_width=True)
+    hd_mean = float(df["hedong"].mean())
+    hx_mean = float(df["hexi"].mean())
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("河东LMP 均价", f"{hd_mean:.0f}")
+    with c2:
+        st.metric("河西LMP 均价", f"{hx_mean:.0f}")
+    with c3:
+        st.metric("价差(河东−河西)", f"{hd_mean - hx_mean:.0f}", help="阻塞核心信号")
+    st.info(f"📉 {target.strftime('%Y-%m-%d')} 预测: 河西新能源指数 renew={pf['hexin_ren'] if pf['hexin_ren'] is not None else '—'}; "
+            f"阻塞分量 cong_hd={pf['cong'][0]:+.0f}/cong_hx={pf['cong'][1]:+.0f} 元/MWh → 价差 {pf['spread_mean']:.0f}。"
+            f"风光大发+断面卡 → 河西砸低、河东更高(售电侧: 河西便宜/河东贵, 择价区采购)。数据来源: {pf['src']}。")
+    st.dataframe(pd.DataFrame(pf["factors"], columns=["影响因子", "状态"]), use_container_width=True, hide_index=True, height=120)
 
 # ==================== 单页报告 ====================
 def render_report():
@@ -1309,8 +1672,12 @@ def render_report():
                "检修详细预测见本页下方 ①~④, 价格/出力已有数据支撑, 负荷待接入。")
     _conn0 = get_conn()
 
-    # 价格预测卡(真实)
+    # 价格预测卡(基线, 保留作对标)
     render_price_forecast_card(_conn0, target_year, target_month)
+
+    # 因子驱动电价模型 v3(河东/河西 LMP + 基线对标 + 回测)
+    st.write("---")
+    render_factor_price_monthly(_conn0, target_year, target_month)
 
     # 出力置信度(天气代理)
     st.markdown("#### 💨 出力置信度（天气代理 · 非实测出力）")
@@ -2920,24 +3287,28 @@ def render_daily():
     _tomorrow = _date.today() + _td(days=1)
     st.markdown("### 🧭 次日快览（交易前）")
     st.caption(f"默认展示 {_tomorrow.strftime('%Y-%m-%d')}（明日）预测; 可在下方『明日价格预测』选择具体日。")
-    _pf_t = price_daily_forecast(_conn_d, _tomorrow)
+    _ren_t = _forecast_renew_idx(_conn_d, _tomorrow)
+    _pf_t = price_factor_daily(_conn_d, _tomorrow)
     _rp_t = renewable_potential(_conn_d, _tomorrow)
     _c1, _c2, _c3, _c4 = st.columns(4)
     if _pf_t and "df" in _pf_t and not _pf_t["df"].empty:
-        _da = _pf_t["df"]["p50"].mean()
+        _hd = float(_pf_t["df"]["hedong"].mean())
+        _hx = float(_pf_t["df"]["hexi"].mean())
         with _c1:
-            st.metric("明日日前均价P50", f"{_da:.0f}", help="同月小时基线均值")
+            st.metric("河东LMP 均价", f"{_hd:.0f}", help="能量价+河东阻塞溢价(因子驱动)")
         with _c2:
-            st.metric("置信区间", f"{_pf_t['df']['lo'].min():.0f}~{_pf_t['df']['hi'].max():.0f}")
+            st.metric("河西LMP 均价", f"{_hx:.0f}", help="能量价+河西阻塞惩罚(可能更低)")
+        with _c3:
+            st.metric("价差(河东−河西)", f"{_hd - _hx:.0f}", help="阻塞核心信号")
     else:
         with _c1:
-            st.metric("明日日前均价P50", "—")
+            st.metric("河东LMP 均价", "—")
         with _c2:
-            st.metric("置信区间", "—")
-    with _c3:
-        st.metric("河西风电潜力", f"{_rp_t['wind_hexi']:.0f}" if (_rp_t and _rp_t.get('wind_hexi') is not None) else "—")
+            st.metric("河西LMP 均价", "—")
+        with _c3:
+            st.metric("价差(河东−河西)", "—")
     with _c4:
-        st.metric("河东风电潜力", f"{_rp_t['wind_hedong']:.0f}" if (_rp_t and _rp_t.get('wind_hedong') is not None) else "—")
+        st.metric("河西风电潜力", f"{_rp_t['wind_hexi']:.0f}" if (_rp_t and _rp_t.get('wind_hexi') is not None) else "—")
 
     # 次日检修事件
     _dfm = load_maint()
@@ -3099,36 +3470,12 @@ def render_daily():
 
     st.divider()
 
-    # ---------- 2.5 明日价格预测(24点) ----------
+    # ---------- 2.5 明日价格预测(因子驱动 · 河东/河西 LMP) ----------
     with st.container(border=True):
-        st.markdown("#### 📈 明日价格预测（24 点 · 统一点）")
-        st.caption("数据源: daily_spot_price(统一点); 方法: 同月同时段基线 P50 ±1.28σ(P10/P90)。"
-                   "⚠ 河东/河西价差待补; 此为基础参考, 实际申报以当日实盘为准。")
         _conn_f = get_conn()
         _def = _date.today() + _td(days=1)
         _fd = st.date_input("预测日期", value=_def, key="fc_day")
-        _pf = price_daily_forecast(_conn_f, _fd)
-        if _pf and "df" in _pf and not _pf["df"].empty:
-            import plotly.graph_objects as go
-            dff = _pf["df"]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=dff["h"], y=dff["hi"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-            fig.add_trace(go.Scatter(x=dff["h"], y=dff["lo"], mode="lines", line=dict(width=0), fill="tonexty",
-                                    fillcolor="rgba(24,95,165,0.18)", name="P10~P90", hoverinfo="skip"))
-            fig.add_trace(go.Scatter(x=dff["h"], y=dff["p50"], mode="lines+markers", name="P50(预测)",
-                                    line=dict(color="#185FA5", width=2)))
-            fig.update_layout(height=340, margin=dict(l=40, r=20, t=30, b=30),
-                              xaxis_title="时段(0-23)", yaxis_title="元/MWh", xaxis=dict(dtick=2))
-            st.plotly_chart(fig, use_container_width=True)
-            _da = dff["p50"].mean()
-            _peak_h = int(dff.loc[dff["p50"].idxmax(), "h"])
-            _val_h = int(dff.loc[dff["p50"].idxmin(), "h"])
-            st.info(f"📈 {_fd.strftime('%Y-%m-%d')} 预测日前均价 {_da:.0f} 元/MWh; 价格高点约 {_peak_h} 时、低点约 {_val_h} 时。"
-                     f"数据来源: {_pf['src']}。")
-        elif _pf and "error" in _pf:
-            st.caption(f"预测异常: {_pf['error']}")
-        else:
-            st.info("现货价数据不足。")
+        render_factor_price_daily(_conn_f, _fd)
         _conn_f.close()
 
     st.divider()
