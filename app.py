@@ -1460,6 +1460,7 @@ def price_factor_monthly(conn, ty, tm):
         }
         spread = {"p50": out["hedong"]["p50"] - out["hexi"]["p50"],
                   "peak": (out["hedong"]["peak"] or 0) - (out["hexi"]["peak"] or 0),
+                  "flat": (out["hedong"]["flat"] or 0) - (out["hexi"]["flat"] or 0),
                   "valley": (out["hedong"]["valley"] or 0) - (out["hexi"]["valley"] or 0)}
         factors = [
             ("负荷", "⏳ 待补(交易平台恢复后导入日度96点)"),
