@@ -3718,42 +3718,50 @@ def render_weekly():
 
     # ---- 顶部: 未来 7 天逐日速览表 ----
     st.markdown("### 📋 未来 7 天逐日速览")
-    st.caption("价格=统一点日前价(同月基线); 出力=天气代理(非实测)。负荷待接入, 暂不列。")
+    st.caption("价格=统一点日前价(同月基线)+天气风光修正; 出力=天气代理(非实测)。负荷待接入, 暂不列。"
+               "历史参考区间很宽是因10月无历史现货价, fallback到全样本, 建议优先看天气情景区间。")
     rows = []
     for d in days:
-        pf = price_daily_forecast(_conn, d)
+        _ren = _forecast_renew_idx(_conn, d)
+        pf = price_daily_forecast(_conn, d, forecast_renew=_ren)
         rp = renewable_potential(_conn, d)
         if pf and "df" in pf and not pf["df"].empty:
-            da_avg = pf["df"]["p50"].mean(); lo = pf["df"]["lo"].min(); hi = pf["df"]["hi"].max()
+            da_avg = float(pf["df"]["p50"].mean())
+            # 天气情景区间：以P50为中心, 风光再±1σ波动(强风光→价更低/弱风光→价更高)
+            _strong = da_avg + B_RENEW * RENEW_ANOM_STD
+            _weak = da_avg - B_RENEW * RENEW_ANOM_STD
+            _lo = float(pf["df"]["lo"].min()); _hi = float(pf["df"]["hi"].max())
         else:
-            da_avg = lo = hi = None
+            da_avg = _strong = _weak = _lo = _hi = None
         rows.append({
             "日期": d.strftime("%m-%d"),
             "日前均价P50": f"{da_avg:.0f}" if da_avg is not None else "—",
-            "置信区间": f"{lo:.0f}~{hi:.0f}" if lo is not None else "—",
+            "天气情景区间(强风光/基准/弱风光)": f"{_strong:.0f}/{da_avg:.0f}/{_weak:.0f}" if da_avg is not None else "—",
+            "历史参考区间(P10~P90)": f"{_lo:.0f}~{_hi:.0f}" if _lo is not None else "—",
             "河西风电潜力": f"{rp['wind_hexi']:.0f}" if (rp and rp.get('wind_hexi') is not None) else "—",
             "河东风电潜力": f"{rp['wind_hedong']:.0f}" if (rp and rp.get('wind_hedong') is not None) else "—",
             "光伏潜力": f"{rp['solar']:.0f}" if (rp and rp.get('solar') is not None) else "—",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # ---- 周度价格 24 点预测(起始月同月基线代表) ----
-    st.markdown("### 💰 周度日前价 24 点预测（起始月同月基线）")
-    pf0 = price_daily_forecast(_conn, start)
+    # ---- 周度价格 24 点预测(起始日+预报天气) ----
+    st.markdown("### 💰 周度日前价 24 点预测（首日为基准 + 预报天气修正）")
+    _ren0 = _forecast_renew_idx(_conn, start)
+    pf0 = price_daily_forecast(_conn, start, forecast_renew=_ren0)
     if pf0 and "df" in pf0 and not pf0["df"].empty:
         import plotly.graph_objects as go
         dfp = pf0["df"]
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["hi"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
         fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["lo"], mode="lines", line=dict(width=0), fill="tonexty",
-                                fillcolor="rgba(24,95,165,0.18)", name="P10~P90", hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["p50"], mode="lines+markers", name="P50(预测)",
+                                fillcolor="rgba(24,95,165,0.18)", name="P10~P90(历史)", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=dfp["h"], y=dfp["p50"], mode="lines+markers", name="P50(天气修正)",
                                 line=dict(color="#185FA5", width=2)))
         fig.update_layout(height=320, margin=dict(l=40, r=20, t=30, b=30),
                           xaxis_title="时段(0-23)", yaxis_title="元/MWh", xaxis=dict(dtick=2))
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"数据源: {pf0['src']}; 周度用起始月同月小时基线代表(各日差异主要体现在风光出力, 见上表)。"
-                   "⚠ 统一点价; 河东/河西价差待补。")
+        st.caption(f"数据源: {pf0['src']}; 已按当日预报风光指数修正P50。P10~P90为历史包络, 因10月样本不足仍较宽, "
+                   "建议结合上表『天气情景区间』使用。⚠ 统一点价; 河东/河西价差待补。")
     else:
         st.info("现货价数据不足, 无法生成周度价格预测。")
 
@@ -3781,13 +3789,29 @@ def render_weekly():
     try:
         _dfw = pd.read_sql("SELECT `时间`,`点位名称`,`风速_10m`,`降水_mm`,`雷暴` FROM weather_hourly "
                            "WHERE `时间`>=%s AND `时间`<=%s ORDER BY `时间`", _conn,
-                           params=(pd.Timestamp(start), pd.Timestamp(end) + _td(hours=23)))
+                           params=(start.strftime("%Y-%m-%d 00:00:00"),
+                                   (end + _td(hours=23, minutes=59)).strftime("%Y-%m-%d %H:%M:%S")))
         if not _dfw.empty:
             _dfw["时间"] = pd.to_datetime(_dfw["时间"])
-            _dfw["触发"] = (_dfw["风速_10m"] > 10.7) | (_dfw["雷暴"] == 1) | (_dfw["降水_mm"] > 0.5)
+            # 提高阈值: 大风>10.7m/s(6级), 强降水>5mm/h, 雷暴=1
+            _dfw["触发"] = (_dfw["风速_10m"] > 10.7) | (_dfw["雷暴"] == 1) | (_dfw["降水_mm"] > 5.0)
             _h = _dfw[_dfw["触发"]]
             if not _h.empty:
                 st.warning(f"⚠ 未来 7 天共 {len(_h)} 条天气风险记录(大风/雷暴/强降水), 可能影响户外检修与风电出力。")
+                _h["日期"] = _h["时间"].dt.date
+                _h["风险标签"] = (
+                    (_h["风速_10m"] > 10.7).map(lambda x: "大风" if x else "") +
+                    (_h["雷暴"] == 1).map(lambda x: "雷暴" if x else "") +
+                    (_h["降水_mm"] > 5.0).map(lambda x: "强降水" if x else "")
+                )
+                _risk_sum = _h.groupby(["日期", "点位名称"]).agg(
+                    最大风速_m_s=("风速_10m", "max"),
+                    最大降水_mm_h=("降水_mm", "max"),
+                    雷暴小时数=("雷暴", "sum"),
+                    风险类型=("风险标签", "first")
+                ).reset_index()
+                st.caption("按日期+站点聚合的小时级风险汇总（大风>10.7m/s、强降水>5mm/h、雷暴）:")
+                st.dataframe(_risk_sum, use_container_width=True, hide_index=True, height=260)
             else:
                 st.success("✅ 未来 7 天天气窗口良好, 无受限预警。")
         else:
