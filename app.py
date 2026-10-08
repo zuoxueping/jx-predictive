@@ -1393,10 +1393,10 @@ def driver_status(conn):
             return int(pd.read_sql(f"SELECT COUNT(*) n FROM `{t}`", conn).iloc[0]['n'])
         except Exception:
             return 0
-    ren_n = _cnt('daily_renewable'); load_n = _cnt('daily_load')
+    ren_n = _cnt('daily_renewable'); load_n = _cnt('daily_load'); elec_n = _cnt('月度用电量')
     tie_n = _cnt('daily_tie_line'); sec_n = _cnt('断面限额')
     rows = [
-        ("负荷", "daily_load", "日度96点 MW", f"{'✅ 已接入' if load_n else '⏳ 待接入(交易平台恢复后导入)'}", "日/周/月"),
+        ("负荷", "daily_load / 月度用电量", "日度96点 MW / 月度亿kWh", f"{'✅ 日度已接入' if load_n else ('🟡 月度代理已接入(月度用电量 %d 月)' % elec_n if elec_n else '⏳ 待接入(交易平台恢复后导入)')}", "日/周/月"),
         ("风光出力", "daily_renewable / weather_hourly", "MW / 天气代理", f"{'✅ 实测已接入' if ren_n else '🟡 天气代理(非实测出力)'}", "日/周/月"),
         ("检修", "检修记录", "A/B级", "✅ 已接入(披露)", "日/周/月"),
         ("断面阻塞", "断面限额 / 节点潮流", "MW / 阻塞", f"{'✅ 限额已接入' if sec_n else '⏳ 潮流待接入(节点价)'}", "日(日前)/周/月"),
