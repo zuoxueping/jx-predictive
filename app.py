@@ -1660,6 +1660,37 @@ def render_report():
     # 第一步: 加权检修影响指数 + 高影响清单
     w_avg, high_df, wstats = predict_weighted_impact(df, target_year, target_month)
 
+    # ===== 月度决策速览(顶部结论卡, 一屏看全, 避免通读全文) =====
+    try:
+        _c = get_conn()
+        _fc = seasonal_forecast(df, target_year, target_month)
+        _er = effective_reserve(reserve_lut, w_avg, target)
+        _pf = price_factor_monthly(_c, target_year, target_month)
+        _c.close()
+        _hd = _pf.get("hedong", {}).get("p50") if isinstance(_pf, dict) else None
+        _hx = _pf.get("hexi", {}).get("p50") if isinstance(_pf, dict) else None
+        _sp = (_hd - _hx) if (_hd is not None and _hx is not None) else None
+        if isinstance(_er, dict) and _er.get("eff") is not None:
+            _eff = _er["eff"]
+            _verdict = ("⚠ 供给偏紧, 建议提前锁量/谨慎报价" if _eff < 10
+                        else "供给偏紧预警, 关注检修集中时段价格上行" if _eff < 20
+                        else "供给相对宽松, 月度合约可争取更优条款")
+        else:
+            _verdict = "备用率数据待补, 结论仅供参考"
+        _ca, _cb, _cc, _cd = st.columns(4)
+        _ca.metric("预测检修项数", f"{_fc['point']}" if _fc and _fc.get("point") else "—",
+                   help=f"历史区间 {_fc['lo']}~{_fc['hi']}" if _fc and _fc.get("lo") else None)
+        _cb.metric("有效备用率", f"{_eff:.1f}%" if isinstance(_er, dict) and _er.get("eff") is not None else "—")
+        _cc.metric("电价P50 河东/河西", f"{_hd:.0f}/{_hx:.0f}" if _hd is not None else "—",
+                   help="元/MWh · 因子模型 v3")
+        _cd.metric("价差(河东−河西)", f"{_sp:.0f}" if _sp is not None else "—",
+                   help="元/MWh · 第一信号")
+        st.info(f"📌 **{target} 月度决策速览**: {_verdict}。价差 {(_sp if _sp is not None else 0):.0f} 元/MWh 为第一信号;"
+                f"下方为各维度明细, 可按需展开。")
+        st.write("---")
+    except Exception as _e:
+        st.caption(f"决策速览加载异常: {_e}")
+
     # ===== 当月检修明细（已披露月份核心面板, 优先展示实测）=====
     is_disclosed = int(df[df["披露月份"] == target].shape[0]) > 0
     if is_disclosed:
