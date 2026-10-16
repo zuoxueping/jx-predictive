@@ -32,6 +32,7 @@ _TABLE_MAP = {
     "daily_tie_line": "daily_tie_line",
     "daily_maintenance": "daily_maint",
     "annual_maintenance": "annual_maint",
+    "section_capacity": "section_cap",
 }
 
 
@@ -3856,17 +3857,20 @@ def render_weekly():
 
 # ==================== 🔧 检修计划(日度 + 年度) ====================
 def render_maint_plan():
-    """日度检修计划 + 年度检修计划 台账页（与「📋 数据台账」的月度披露记录互补）。"""
-    st.markdown("# 🔧 检修计划（日度 + 年度）")
-    st.caption("数据源: 日度检修计划(2026.9–2026.10, 公开披露 xlsx) + 年度检修计划(2025/2026 PDF)。"
+    """日度检修计划 + 年度检修计划 + 断面可用容量（阻塞信号）台账页。"""
+    st.markdown("# 🔧 检修计划（日度 + 年度 + 断面）")
+    st.caption("数据源: 日度检修计划(xlsx) + 年度检修计划(PDF) + **断面可用容量**(月度/周度 xlsx, 解锁阻塞模型)。"
                "本页为计划类检修台账查询，与「📋 数据台账」的月度实际检修披露记录互补。")
-    tab = st.radio("计划类型", ["📆 日度检修计划", "📅 年度检修计划"], label_visibility="collapsed")
+    tab = st.radio("计划类型", ["📆 日度检修计划", "📅 年度检修计划", "🔌 断面可用容量"],
+                   label_visibility="collapsed")
     conn = get_conn()
     try:
         if tab.startswith("📆"):
             _render_daily_plan(conn)
-        else:
+        elif tab.startswith("📅"):
             _render_annual_plan(conn)
+        else:
+            _render_section_plan(conn)
     finally:
         conn.close()
 
@@ -3940,6 +3944,68 @@ def _render_annual_plan(conn):
     st.dataframe(show, use_container_width=True, hide_index=True, height=460)
     csv = show.to_csv(index=False).encode("utf-8-sig")
     st.download_button("📥 导出 CSV", csv, "年度检修计划.csv", "text/csv")
+
+
+def _render_section_plan(conn):
+    """断面可用容量（阻塞信号）视图。
+
+    核心价值: 河西→主网/河东 各输电断面的正向限额(万千瓦)是阻塞模型的硬约束。
+    当某断面因检修导致限额显著低于其常态值 → 河西新能源外送受限 → 河西价被砸低、河东价抬升 → 价差扩大。
+    本视图把这一信号直观呈现在交易员面前。
+    """
+    df = pd.read_sql(
+        "SELECT granularity, period_label, ref_date, interface, zone, time_range, "
+        "fwd_dafa_wk, fwd_dafa_yk, fwd_zhongfa_wk, fwd_zhongfa_yk, fwd_xiaofa_wk, fwd_xiaofa_yk, "
+        "rev_dafa_wk, rev_dafa_yk, fwd_limit, rev_limit, source_file "
+        "FROM section_capacity ORDER BY interface, period_label, ref_date", conn)
+    if df.empty:
+        st.info("断面可用容量暂无数据：请先运行 parse_section_capacity.py 导入 月度/周度 xlsx。")
+        return
+    # 每个断面的常态上限(基准), 用于识别"检修导致的限额下降"
+    base = df.groupby("interface")["fwd_limit"].transform("max")
+    df["基准限额"] = base
+    df["受限信号"] = df.apply(
+        lambda r: ("⚠ 限额下降" if (pd.notna(r["fwd_limit"]) and pd.notna(r["基准限额"])
+                                    and r["fwd_limit"] < r["基准限额"] * 0.92) else ""),
+        axis=1)
+
+    gran = st.radio("粒度", ["周度", "月度"], label_visibility="collapsed")
+    dg = df[df["granularity"] == ("周" if gran == "周度" else "月")].copy()
+    interfaces = sorted(dg["interface"].unique().tolist())
+    west = [x for x in interfaces if "河西外送" in str(dg[dg["interface"] == x]["zone"].iloc[0])]
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        sel_i = st.multiselect("断面", interfaces,
+                               default=west if west else interfaces,
+                               help="标注「河西外送」的是河西新能源外送主通道，对价差信号最关键")
+    with c2:
+        if gran == "周度":
+            months = sorted(dg["ref_date"].dropna().astype(str).str[:7].unique().tolist())
+            sel_m = st.selectbox("月份", ["全部"] + months)
+        else:
+            sel_m = "全部"
+    sub = dg[dg["interface"].isin(sel_i)]
+    if sel_m != "全部" and gran == "周度":
+        sub = sub[sub["ref_date"].astype(str).str[:7] == sel_m]
+
+    warn_n = int((sub["受限信号"] != "").sum())
+    st.markdown(f"**共 {len(sub):,} 条**（{gran}度，{sub['interface'].nunique()} 个断面）"
+                + (f"　🔴 **{warn_n} 条标注「限额下降」→ 河西外送受限/价差扩大风险**" if warn_n else ""))
+    st.caption("读法：正向限额(大发无稳控) = 河西新能源大发时该断面能往东送的最大容量(万千瓦)。"
+               "数值越低 → 河西出力越容易被堵在本地 → 河西价跌、河东价涨 → 价差走阔。"
+               "「⚠ 限额下降」= 该值明显低于此断面常态，多由检修引起。")
+
+    show = sub[["interface", "zone", "period_label", "ref_date", "time_range",
+                "fwd_dafa_wk", "fwd_dafa_yk", "fwd_zhongfa_wk", "fwd_xiaofa_wk",
+                "rev_dafa_wk", "fwd_limit", "rev_limit", "受限信号"]].copy()
+    show = show.rename(columns={
+        "interface": "断面", "zone": "区域", "period_label": "周期", "ref_date": "日期",
+        "time_range": "月度时间窗", "fwd_dafa_wk": "正向(大发/无稳控)", "fwd_dafa_yk": "正向(大发/有稳控)",
+        "fwd_zhongfa_wk": "正向(中发/无稳控)", "fwd_xiaofa_wk": "正向(小发/无稳控)",
+        "rev_dafa_wk": "反向(大发/无稳控)", "fwd_limit": "代表正向限额", "rev_limit": "代表反向限额"})
+    st.dataframe(show, use_container_width=True, hide_index=True, height=460)
+    csv = show.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📥 导出 CSV", csv, "断面可用容量.csv", "text/csv")
 
 
 # ==================== 入口 ====================
